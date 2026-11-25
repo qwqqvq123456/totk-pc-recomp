@@ -1,0 +1,202 @@
+name: Sync upstream
+
+# Keeps the fork level with valentderah/totk-pc-recomp: every run merges the upstream branch, writes the changelog section
+# of the sync and pushes the tag v<VERSION>-sync.<n>. Release runs on that tag (.github/workflows/release.yml), so a sync
+# ends in a published release without anyone touching the repository.
+#
+# A conflict stops the run, leaves main untouched and opens an issue with the files to fix: the fork's own files are
+# .github/ and CHANGELOG.md, so a conflict means upstream changed something the fork also holds and a person has to decide.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # every 6 hours; GitHub runs schedules late under load
+  workflow_dispatch:
+    inputs:
+      merge_strategy:
+        description: What to do when the merge conflicts
+        type: choice
+        options:
+          - stop
+          - prefer-ours
+        default: stop
+      release_without_changes:
+        description: Tag and release the current main even if upstream has nothing new
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: valentderah/totk-pc-recomp
+  UPSTREAM_BRANCH: main
+  MERGE_STRATEGY: ${{ inputs.merge_strategy || 'stop' }}
+  RELEASE_WITHOUT_CHANGES: ${{ inputs.release_without_changes || 'false' }}
+
+jobs:
+  sync:
+    name: Merge upstream, read the changelog, push the tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::The repository secret SYNC_TOKEN is missing. Add a personal access token with the repo scope:"
+            echo "::error::gh secret set SYNC_TOKEN --repo $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Look for upstream commits the fork does not have
+        id: upstream
+        run: |
+          upstream_sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          # The last upstream commit the fork merged is the merge base of the two branches.
+          synced_sha=$(git merge-base HEAD "upstream/$UPSTREAM_BRANCH" || true)
+          base_version=$(tr -d '[:space:]' < VERSION)
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "synced_sha=$synced_sha" >> "$GITHUB_OUTPUT"
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "main already has $UPSTREAM_REPO@$upstream_sha"
+          else
+            count=$(git rev-list --count "HEAD..$upstream_sha")
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "commit_count=$count" >> "$GITHUB_OUTPUT"
+            echo "main is $count commit(s) behind $UPSTREAM_REPO@$upstream_sha"
+          fi
+
+      - name: Stop here when there is nothing to sync
+        if: steps.upstream.outputs.changed == 'false' && env.RELEASE_WITHOUT_CHANGES != 'true'
+        run: |
+          {
+            echo "### Nothing to sync"
+            echo
+            echo "\`main\` already carries \`$UPSTREAM_REPO@${{ steps.upstream.outputs.upstream_sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge upstream
+        id: merge
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          COMMIT_COUNT: ${{ steps.upstream.outputs.commit_count }}
+        run: |
+          message=$(printf 'Sync with %s at %s (%s commits)' "$UPSTREAM_REPO" "${UPSTREAM_SHA:0:7}" "$COMMIT_COUNT")
+          if git merge --no-ff --no-edit -m "$message" "upstream/$UPSTREAM_BRANCH"; then
+            echo "merged=clean" >> "$GITHUB_OUTPUT"
+          else
+            conflicts=$(git diff --name-only --diff-filter=U | paste -sd' ' -)
+            git merge --abort
+            echo "conflicts=$conflicts" >> "$GITHUB_OUTPUT"
+            if [ "$MERGE_STRATEGY" = 'prefer-ours' ]; then
+              echo "::warning::Merge conflicted in $conflicts; keeping the fork's side of those hunks (prefer-ours)"
+              git merge --no-ff --no-edit -X ours -m "$message" "upstream/$UPSTREAM_BRANCH"
+              echo "merged=prefer-ours" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Merge conflicted in $conflicts; main was left untouched"
+              exit 1
+            fi
+          fi
+
+      - name: Work out this sync's version and tag
+        id: version
+        run: |
+          base='${{ steps.upstream.outputs.base_version }}'
+          highest=0
+          for tag in $(git tag -l "v$base-sync.*"); do
+            number=${tag##*.}
+            [ "$number" -gt "$highest" ] 2>/dev/null && highest=$number
+          done
+          tag="v$base-sync.$((highest + 1))"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "This sync is $tag (upstream VERSION is $base)"
+
+      - name: Write the changelog section
+        id: changelog
+        env:
+          FROM_SHA: ${{ steps.upstream.outputs.synced_sha }}
+          TO_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+        run: |
+          python3 .github/scripts/changelog.py add \
+            --from "$FROM_SHA" \
+            --to "$TO_SHA" \
+            --version '${{ steps.version.outputs.base }}' \
+            --tag '${{ steps.version.outputs.tag }}'
+
+      - name: Fold the section into the sync commit
+        run: |
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md is unchanged"
+          elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit --amend --no-edit
+          else
+            git commit -m "Add the changelog section for ${{ steps.version.outputs.tag }}"
+          fi
+
+      - name: Push main
+        run: |
+          git push origin HEAD:main
+
+      - name: Tag the sync
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          git tag -a "$tag" -m "Sync with $UPSTREAM_REPO at ${{ steps.upstream.outputs.upstream_sha }}"
+          git push origin "refs/tags/$tag"
+          {
+            echo "### $tag"
+            echo
+            echo "Merged \`$UPSTREAM_REPO@${{ steps.upstream.outputs.upstream_sha }}\` into \`main\` and pushed the tag;"
+            echo "the Release workflow publishes it."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat CHANGELOG.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a conflict
+        if: failure() && steps.merge.outputs.conflicts != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 20 \
+            --search 'in:title "Upstream sync conflicted"' --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf 'The sync conflicted again in: `%s` ([run](%s)).' "$CONFLICTS" "$run_url")"
+            exit 0
+          fi
+          body_file=$(mktemp)
+          {
+            printf 'The sync with `%s` stopped: `main` was left untouched and nothing was tagged.\n\n' "$UPSTREAM_REPO"
+            printf 'Conflicted files: `%s`\n\n' "$CONFLICTS"
+            printf 'Merge upstream by hand, keep the fork'"'"'s side where it is fork-only (`.github/`, `CHANGELOG.md`),\n'
+            printf 'push, then dispatch the Sync upstream workflow again ([this run](%s)).\n\n' "$run_url"
+            printf 'To let the next run keep the fork'"'"'s side of the conflicting hunks instead, dispatch it with\n'
+            printf '`merge_strategy` set to `prefer-ours`.\n'
+          } > "$body_file"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Upstream sync conflicted in: $CONFLICTS" --body-file "$body_file"
