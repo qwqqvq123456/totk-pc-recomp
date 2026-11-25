@@ -12,9 +12,17 @@ Release (docs/installer.md "Release layout"), root = the unpacked folder:
                             include/ + lib/ of Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
     bin/                    totk_xlate.exe (+ totk_xlate.id), hactool.exe, ninja.exe, SDL3.dll, libopus-0.dll
     data/shader_list.tsv    the MacNativeGames shader list
+    data/pgo-<v>.profdata   the execution profile the update's code is compiled with (tools/pgo.py; Windows only);
+                            without one the game is built at -O1
     totk.ini.example
     VERSION                 the release version, one line
-    temp/                   the default temp folder (created)
+
+Build kit (Windows release): the setup copies the release folder without TotK-Setup.exe into <install>/build-kit
+(KIT_ITEMS, steps.py Kit) and runs every later step from it, so the game's rebuild for its mods
+(build-cache/rebuild.txt, relative to the install folder) needs neither the setup folder nor its path: the setup can be
+deleted and the install folder moved. The kit is a release folder itself (release_layout). The temp folder with the
+rebuild's working state (gen/, build/, the lift cache) is <install>/build-cache/work (TEMP_IN_DEST), so it moves
+with the install and survives a newer setup's kit.
 
 Linux release (the AppImage's folder, docs/installer.md "Linux release"): python/bin/python3 (python-build-standalone,
 with tkinter), llvm/ with clang, lld and llvm-ar plus llvm/sysroot (the glibc headers and libraries the game links
@@ -24,9 +32,11 @@ Dev mode, root = a repository checkout (no python/python.exe): build/py314-embed
 Python the release ships, with the same packages), else this Python; toolchain/llvm-mingw-*/ and toolchain/deps-mingw;
 runtime/ as the sources with build/install-rtlib/libtotkrt.a and libtotkrt-v2.a (tools/build_game.py --make-runtime-lib
 --out build/install-rtlib, once per --cpu); MSYS2 UCRT64 ninja.exe; toolchain/hactool; build/xlate/totk_xlate.exe; the shader list from
-refs/MacNativeGames; build/install-temp. The version is VERSION with -dev and the commit: 0.1.0-dev+973c626. On Linux,
-dev mode takes clang, lld and ninja from PATH and the system's libraries (no deps folder, no SDL3 copy).
+refs/MacNativeGames; build/pgo/pgo-<v>.profdata when there is one; build/install-temp/<install name>-<hash>. The
+version is VERSION with -dev and the commit: 0.1.0-dev+973c626. Dev mode and the Linux release install no build kit:
+the repository, or the AppImage file, is what the rebuild runs. On Linux, dev mode takes clang, lld and ninja from PATH and the system's libraries (no deps folder, no SDL3 copy).
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -38,6 +48,14 @@ WIN = os.name == 'nt'
 EXE = '.exe' if WIN else ''
 UCRT = Path(r'C:\msys64\ucrt64\bin')
 SUPPORTED = ('1.2.1', '1.4.3', '1.1.0')   # updates the installer builds; the check identifies the player's by hash
+KIT = 'build-kit'   # the build kit's folder in the install folder
+# What the build kit holds of a release folder (tools/make_release.py writes them): all but TotK-Setup.exe. licenses/
+# and THIRD_PARTY_NOTICES.md go along with the binaries they cover.
+KIT_ITEMS = ('python', 'llvm', 'runtime', 'bin', 'recomp', 'tools', 'data', 'installer', 'licenses',
+             'THIRD_PARTY_NOTICES.md', 'totk.ini.example', 'VERSION')
+# The temp folder inside the install folder, for a layout that names none (every release); the check step does not
+# count it when it requires an empty install folder. Linux keeps the name its installs already use.
+TEMP_IN_DEST = Path('build-cache', 'work') if WIN else Path('.setup-temp')
 
 
 def version_tag(version):
@@ -66,6 +84,7 @@ class Layout:
     temp: Path | None = None
     sysroot: Path | None = None       # Linux release: what the game links against, instead of the host's
     runtime_lib_v2: Path | None = None   # libtotkrt-v2.a: the runtime for CPUs without AVX2 (build_game.py --cpu v2)
+    pgo_dir: Path | None = None       # pgo-<v>.profdata (tools/pgo.py); None: no profiles (Linux)
 
     @property
     def clang(self):
@@ -79,6 +98,12 @@ class Layout:
             return lib
         return None if self.dev else lib
 
+    def pgo(self, version):
+        """The execution profile build_game.py --pgo compiles the update's code with, None without one (the game is
+        then built at -O1)."""
+        p = self.pgo_dir / f'pgo-{version_tag(version)}.profdata' if self.pgo_dir else None
+        return p if p and p.is_file() else None
+
     def patches(self, version):
         """The code patch table for recomp/gen.py."""
         return self.recomp / f'patches-{version_tag(version)}.txt'
@@ -90,7 +115,8 @@ class Layout:
     def missing(self, cpu='v3'):
         """Paths the steps need that do not exist. cpu picks the runtime library the host will use."""
         lib = self.runtime_lib_for(cpu)
-        need = [self.python, self.tools / 'extract.py', self.tools / 'build_game.py', self.tools / 'prepare_shaders.py',
+        need = [self.python, self.tools / 'extract.py', self.tools / 'ncz.py', self.tools / 'build_game.py',
+                self.tools / 'prepare_shaders.py',
                 self.tools / 'pack_shader_cache.py', self.tools / 'make_romfs_patches.py', self.tools / 'ultrawide_layout.py',
                 self.tools / 'button_icons.py',
                 self.tools / 'vendor' / 'macnativegames' / 'extract_shared_fonts.py',
@@ -128,9 +154,11 @@ def release_layout(root):
         xlate=root / 'bin' / ('totk_xlate' + EXE),
         dlls=(root / 'bin' / 'SDL3.dll', root / 'bin' / 'libopus-0.dll') if WIN else (root / 'bin' / 'libSDL3.so.0',),
         shader_list=root / 'data' / 'shader_list.tsv', ini_example=root / 'totk.ini.example',
-        # Linux: None, the install folder's .setup-temp (installer/cli.py): the AppImage is mounted read-only, and on
-        # a Steam Deck /home is often too full for the generated C while the install folder is on the SD card
-        temp=root / 'temp' if WIN else None,
+        pgo_dir=root / 'data' if WIN else None,
+        # None: the install folder's TEMP_IN_DEST (temp_for). Windows: the rebuild's working state stays with the install
+        # and its build kit. Linux: the AppImage is mounted read-only, and on a Steam Deck /home is often too full for
+        # the generated C while the install folder is on the SD card
+        temp=None,
         sysroot=None if WIN else root / 'llvm' / 'sysroot')
 
 
@@ -153,7 +181,8 @@ def dev_layout(root):
         ninja=UCRT / ('ninja' + EXE), hactool=root / 'toolchain' / 'hactool' / ('hactool' + EXE),
         xlate=root / 'build' / 'xlate' / ('totk_xlate' + EXE),
         dlls=tuple(sorted((deps / 'bin').glob('*.dll'))),
-        shader_list=None, ini_example=root / 'totk.ini.example', temp=root / 'build' / 'install-temp')
+        shader_list=None, ini_example=root / 'totk.ini.example', temp=root / 'build' / 'install-temp',
+        pgo_dir=root / 'build' / 'pgo')
 
 
 def dev_commit(root):
@@ -179,3 +208,26 @@ def find(root=None):
     """The layout of root (default: the folder above this package)."""
     root = Path(root or Path(__file__).resolve().parent.parent).resolve()
     return release_layout(root) if is_release(root) else dev_layout(root)
+
+
+def uses_kit(layout):
+    """True when the setup installs a build kit (Windows release); dev mode and the Linux AppImage run from where they
+    are."""
+    return WIN and not layout.dev
+
+
+def kit_folder(dest):
+    return Path(dest) / KIT
+
+
+def temp_folder(base, dest):
+    """One temp folder per install folder below a shared base (dev mode, --temp), so two installs never share
+    generated files."""
+    tag = hashlib.sha256(str(dest).lower().encode()).hexdigest()[:8]
+    return base / f'{dest.name or "root"}-{tag}'
+
+
+def temp_for(layout, dest, override=None):
+    """The temp folder of a run on dest: below --temp or the layout's, else TEMP_IN_DEST in the install folder."""
+    base = override or layout.temp
+    return temp_folder(Path(base).resolve(), dest) if base else dest / TEMP_IN_DEST

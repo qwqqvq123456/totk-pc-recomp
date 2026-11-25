@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -197,6 +198,7 @@ NVN_API(nvnTextureInitialize) {
     o->magic = NVN_TEX_MAGIC;
     o->d = s->d;
     o->pool = s->pool;
+    o->pool_flags = s->pool ? (uint16_t)s->pool->flags : 0;
     o->off = s->off;
     o->has_layout = s->has_layout;
     memcpy(o->layout, s->layout, 8);
@@ -666,8 +668,12 @@ static void sleep_until(uint64_t deadline) {
 }
 
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow *w, NVNsync *s, int *index): blocks here, not in the
-// present, until the image's previous present plus one period has passed (the game often presents with a lock held).
-// That is the time the next frame goes to the display, so the image is free as soon as that time is reached.
+// present, until the image is free (the game often presents with a lock held). Without the frame queue that is the
+// image's previous present plus one period, when the next frame goes to the display, so a frame gets exactly one period
+// from acquire to present. Its present is a copy already on the queue by its display time, so with the frame queue
+// (TOTK_FRAME_QUEUE=1) the image is free from that time on: the game draws the next frame while the previous one waits
+// for its turn, and a frame that takes up to one more period still makes its slot, for up to one frame more latency.
+// Town at 4K with DLAA at 60 on an RTX 5070: frames over 17.5 ms 1-8 per 30 s with the queue against 25-33 without.
 NVN_API(nvnWindowAcquireTexture) {
     win_t *o = arg_p(c, 0);
     sync_t *s = arg_p(c, 1);
@@ -681,6 +687,8 @@ NVN_API(nvnWindowAcquireTexture) {
         sleep_until(at);
         perf_end(PERF_PACE, p0);
     }
+    vk_reflex_sleep();
+    vk_reflex_marker(0, vk_reflex_frame_begin());   // VK_LATENCY_MARKER_SIMULATION_START_NV: a new frame and its ID
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {
@@ -692,22 +700,26 @@ NVN_API(nvnWindowAcquireTexture) {
 
 // void nvnQueuePresentTexture(NVNqueue *q, NVNwindow *w, int index): queues the copy and returns at once. The display
 // time comes from the pacer: the back end's present thread holds the host present until then (back-edge pacing, as the
-// Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later the
-// image is free for the next acquire. Added latency: the slack of the frame (period minus its work), as on the Switch.
+// Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later (at that
+// time with the frame queue) the image is free for the next acquire. Added latency: the slack of the frame (period minus
+// its work), as on the Switch, plus up to a period with the frame queue.
 NVN_API(nvnQueuePresentTexture) {
     win_t *o = arg_p(c, 1);
     int idx = (int)arg_x(c, 2);
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
+    res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
     o->presents++;
+    vk_reflex_marker(1, vk_reflex_frame());   // VK_LATENCY_MARKER_SIMULATION_END_NV
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
+    nvn_sync_ahead_present();
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;
-    o->avail[idx] = slot + period;
+    o->avail[idx] = cfg_bool("TOTK_FRAME_QUEUE") ? slot : slot + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
 }

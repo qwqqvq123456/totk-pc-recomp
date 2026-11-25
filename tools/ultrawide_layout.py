@@ -12,6 +12,7 @@ found for 1.0.0 .. 1.2.1 (GPL; only those values are taken, no code; THIRD_PARTY
 implementation, checked against 1.2.1's Common.Product.110 and 1.4.3's Common.Product.140: every pane is found by name
 and every pane field and animation key holds the value the edit expects before it is written.
 """
+import math
 import struct
 
 # BFLYT pane sections (pan1, pic1, txt1, ...): name at +12 (24 bytes), translate x / y at +44 / +48, scale x / y at +68 / +72.
@@ -22,10 +23,50 @@ FIELD = {'x': 44, 'y': 48, 'scale_x': 68, 'scale_y': 72}
 KEEP_ROOT = {'AppMenuBG_00', 'PauseMenuBG_00', 'ShopMenuParasailBG_00', 'ShortCutBG_00', 'TitleMenuBG_00', 'EventFade_00',
              'EventFadeWipe_00', 'CameraShutter_00', 'PaAppPictureBookDetail_00', 'AppMenuOverlay_00'}
 
-def edits(k, hud_corner):
+# Layouts whose markers the game places over a point in the world (the lock-on arrow, the name of the item or character
+# in front of Link, enemy life bars and notices, speech balloons): the code moves a pane under the root to the target's
+# projected position in the 1920x1080 grid, which spans the whole canvas. Under a scaled root that position would be
+# scaled too, so the marker lands short of its target, toward the middle of the screen (at half the distance on 32:9).
+# Their root keeps scale 1 and the scale goes one level down instead, to the panes listed here: ones the code does not
+# move and no animation scales, so the markers keep their 16:9 proportions.
+MARKER_ROOT = {
+    'AttentionBalloon_00': ('C_Capture_00', 'N_InOut_00'),       # N_PosRoot_00 moves; N_InOut_00 animates y and alpha
+    'AttentionLockOn_00': ('N_Offset_00',),                       # N_PosRoot_00 moves; N_Offset_00 animates y
+    'EnemyInfo_00': ('Pa_EnemyLife_00', 'Pa_EnemyNotice_00'),     # the parts move; N_EnemyLifeArea_* stay screen-sized
+    'BalloonMessage_00': (),   # the speech balloon part is pooled: its scale goes inside, see BALLOON_PART
+    # The ability reticle (seen with Recall): N_App_00 moves to the target (a pane's own scale doesn't scale its
+    # position); its children's scales are animated. The bow and throw pointers stay centred.
+    'Pointer_00': ('N_App_00', 'N_Arrow_00', 'N_WeaponThrow_00'),
+    # The Recall gauge ring: N_Trans_00 moves to the object and the code sets its scale by distance, so the scale goes
+    # on the ring's pictures (mirrored, -1 as shipped; turned 0 or 180 degrees, so a scale on x stays undistorted).
+    'ModorecoGauge_00': ('P_Smoke_00', 'P_Sh_00') + tuple(f'P_{p}{s}_00' for p in ('Base', 'Glow', 'Main', 'MainLight',
+                                                                                 'BandLight') for s in 'LR'),
+}
+
+# Speech balloons are pooled: the game clones Pa_BalloonMessage_00 into Pa_BalloonMessage_%02d at run time, and the clones
+# don't keep a scale set on the template part pane, so they drew at full canvas width. The scale goes on the part
+# layout's top panes instead (their offset scaled with them, so they sit where a scaled root would put them); its
+# animations only key alpha, visibility and N_Loop_00's y. (pane, x, y) as shipped.
+BALLOON_PART = (('C_CaptureBase_00', 226.0, 20.0), ('N_InOut_00', 30.0, -10.0))
+
+def hud_extent(k, hud_aspect):
+    """(w_hud, right_hud) for the HUD: how far its edge moves out in a 1920-wide layout's own units (960 * (1 / kc - 1))
+    and in the grid units of a root pane already scaled by k (960 * k * (1 / kc - 1)), where kc = (16/9) / C and C is
+    the HUD's aspect: hud_aspect, never wider than the screen's 16/9 / k. None (or a cap that is not narrower than the
+    screen) puts the HUD at the screen's edges: the same w and 960 * (1 - k) the screen itself uses. C = 16/9 gives
+    (0, 0), the HUD in the middle 16:9 as shipped."""
+    screen = (16 / 9) / k
+    if hud_aspect is None or hud_aspect >= screen * 0.99: return 960 * (1 / k - 1), 960 * (1 - k)
+    inner = 1 / ((16 / 9) / hud_aspect) - 1   # 1 / kc - 1
+    return 960 * inner, 960 * k * inner
+
+def edits(k, hud_aspect):
     """(layout, pane, field, value) for the aspect: k = 16/9 over the aspect (the root's scale), w = how far a 1920-wide
-    layout's edge moves out in its own units (960 * (1 / k - 1)). OFF moves a pane out of sight."""
+    layout's edge moves out in its own units (960 * (1 / k - 1)). OFF moves a pane out of sight. hud_aspect: the
+    widest aspect the HUD spreads over (None = the screen's, see hud_extent); w_hud and right_hud replace w and the
+    root's x for the HUD panes below, everything else belongs to the screen and keeps w and k."""
     w, OFF = 960 * (1 / k - 1), 10000.0
+    w_hud, right_hud = hud_extent(k, hud_aspect)
     wide = 1 / k
     out = [
         ('AppAlbum_00', 'N_FadeInOut_00', 'scale_x', k), ('AppAlbum_00', 'N_Open_01', 'scale_x', wide),
@@ -52,8 +93,11 @@ def edits(k, hud_corner):
         ('PaCommonBtnTitle_00', 'B_Hit_00', 'x', OFF), ('PaCommonBtnTitle_00', 'N_Cursor_00', 'x', OFF),
         ('PaLargeDungeonMap_00', 'P_BG_00', 'scale_x', wide), ('PaMessageBtn_00', 'B_Hit_00', 'x', OFF),
         ('PaRecipeCardList_00', 'P_BG_00', 'scale_x', wide),
-        ('SaveLoadIcon_00', 'RootPane', 'x', -960 * (1 - k)),
+        # The saving indicator follows the same selected HUD area as the other corner indicators.
+        ('SaveLoadIcon_00', 'RootPane', 'x', -right_hud),
         ('ShopMenu_00', 'N_BG_00', 'scale_x', wide), ('StaffRoll_00', 'N_BG_00', 'scale_x', wide),
+        *[e for pane, x, _ in BALLOON_PART for e in (('PaBalloonMessage_00', pane, 'scale_x', k),
+                                                      ('PaBalloonMessage_00', pane, 'x', x * k))],
     ]
     # Menus framed by two side decorations, a header and a background: the frame stays at the screen's edges.
     for layout, deco in (('PauseMenuOverlay_00', 'P_Deco{}_00'), ('SystemLoadList_00', 'P_Deco{}_00'),
@@ -69,18 +113,17 @@ def edits(k, hud_corner):
             ('SystemActionGuide_00', 'N_SystemBG_00', 'scale_x', wide),
             ('SystemActionGuide_00', 'P_DecoL_01', 'scale_x', k), ('SystemActionGuide_00', 'P_DecoL_01', 'x', -(675 + w) * k),
             ('SystemActionGuide_00', 'P_DecoL_02', 'scale_x', k), ('SystemActionGuide_00', 'P_DecoL_02', 'x', (675 + w) * k)]
-    if hud_corner:   # the HUD in the screen's corners instead of the middle 16:9
-        right = 960 * (1 - k)
-        out += [(name, 'RootPane', 'x', right) for name in ('EnvironmentInfo_00', 'EventSkip_00', 'InstantTipsAppMenu_00',
+    if hud_aspect is None or hud_aspect > 16 / 9:   # the HUD out to its area's edges; at 16:9 it stays as shipped
+        out += [(name, 'RootPane', 'x', right_hud) for name in ('EnvironmentInfo_00', 'EventSkip_00', 'InstantTipsAppMenu_00',
                                                              'InstantTipsWithPict_00', 'InstantTips_00', 'NumDisplaySecond_00',
                                                              'NumDisplay_00', 'PickUpWin_00')]
-        out += [('Location_00', 'N_Small_00', 'x', -(388 + w)),
-                ('PlayerStatus3D_00', 'N_ExtraStaminaTarget_01', 'x', -(745 + w)),
-                ('PlayerStatus_00', 'N_DevilDemoTargetC_00', 'x', -(284 + w)),
-                ('PlayerStatus_00', 'N_DevilDemoTargetLT_00', 'x', -(576 + w)),
-                ('PlayerStatus_00', 'N_HeartGaugeTargetLT_00', 'x', -(576 + w)),
-                ('PlayerStatus_00', 'N_HeartPos_00', 'x', -w),
-                ('PlayerStatus_00', 'Pa_CompanionLife_00', 'x', -(840 + w))]
+        out += [('Location_00', 'N_Small_00', 'x', -(388 + w_hud)),
+                ('PlayerStatus3D_00', 'N_ExtraStaminaTarget_01', 'x', -(745 + w_hud)),
+                ('PlayerStatus_00', 'N_DevilDemoTargetC_00', 'x', -(284 + w_hud)),
+                ('PlayerStatus_00', 'N_DevilDemoTargetLT_00', 'x', -(576 + w_hud)),
+                ('PlayerStatus_00', 'N_HeartGaugeTargetLT_00', 'x', -(576 + w_hud)),
+                ('PlayerStatus_00', 'N_HeartPos_00', 'x', -w_hud),
+                ('PlayerStatus_00', 'Pa_CompanionLife_00', 'x', -(840 + w_hud))]
     return out
 
 SYSTEM_MENUS = ('SystemLoadList_00', 'SystemOption_00', 'SystemSaveLoad_00')
@@ -104,7 +147,9 @@ def tall_edits(k):
            *[('CameraPointer_00', p, 'scale_y', tall) for p in ('N_InOutScope_00', 'Pa_CameraFocus_00', 'S_Scissor_00',
                                                                  'W_Shadow_01')],
            ('CameraSystemWindow_00', 'N_InOut_00', 'scale_y', tall), ('MessageLog_01', 'P_Capture_00', 'scale_y', tall),
-           *[(layout, 'N_SystemBG_00', 'scale_y', tall) for layout in ('SystemActionGuide_00',) + SYSTEM_MENUS]]
+           *[(layout, 'N_SystemBG_00', 'scale_y', tall) for layout in ('SystemActionGuide_00',) + SYSTEM_MENUS],
+           *[e for pane, _, y in BALLOON_PART for e in (('PaBalloonMessage_00', pane, 'scale_y', k),
+                                                         ('PaBalloonMessage_00', pane, 'y', y * k))]]
     # The HUD at the screen's top and bottom edges instead of the middle 16:9
     out += [(name, 'RootPane', 'y', 540 * (1 - k)) for name in (
         'AppAlbum_00', 'AppPictureBook_00', 'ChallengeLog_00', 'Challenge_00', 'InstantTipsWithPict_00', 'InstantTips_00',
@@ -187,12 +232,13 @@ def tall_anim(blarc, members, k, changed):
     if len(curves) != 1 or values != [1.08, 1.28]: raise SystemExit(f'PaMapIconDragonTears_00_Zoom P_Geoglyph_00: keys {values}')
     for key in curves[0]: put(key + 4, get(key + 4) / k)
 
-def anim_edits(k, hud_corner):
-    """(animation, byte offset, value the game ships, new value): floats inside BFLAN key tables."""
-    w = 960 * (1 / k - 1)
+def anim_edits(k, hud_aspect):
+    """(animation, byte offset, value the game ships, new value): floats inside BFLAN key tables. hud_aspect as in
+    edits."""
+    w_hud, _ = hud_extent(k, hud_aspect)
     out = [('PaMapIconDragonTears_00_Zoom', 288, 1.08, 1.08 / k), ('PaMapIconDragonTears_00_Zoom', 300, 1.28, 1.28 / k)]
-    if hud_corner:   # the minimap's slide-in keys end at x 765, the right edge of a 16:9 layout
-        out += [('AppMap_00_MiniMap', o, 765.0, 765 + w) for o in (872, 880, 1628, 1636, 3264, 3272, 3468, 3476)]
+    if hud_aspect is None or hud_aspect > 16 / 9:   # the minimap's slide-in keys end at x 765, the right edge of a 16:9 layout
+        out += [('AppMap_00_MiniMap', o, 765.0, 765 + w_hud) for o in (872, 880, 1628, 1636, 3264, 3272, 3468, 3476)]
     return out
 
 def panes(blarc, lo, hi):
@@ -213,17 +259,25 @@ def find_pane(found, layout, name):
     if name not in found: raise SystemExit(f'{layout}: no pane {name}')
     return found[name]
 
-def apply(blarc, members, width, height, hud_corner=True):
+def apply(blarc, members, width, height, hud_aspect=None):
     """Edits blarc (bytearray) in place for a width x height canvas of another shape than 16:9. Returns the members it
-    changed. hud_corner (wider canvases): the HUD goes to the screen's corners; a narrower one always has it at the
-    top and bottom edges."""
+    changed. hud_aspect (wider canvases): the widest aspect the HUD spreads over, centred on the screen (21:9 =
+    21 / 9, 16:9 = 16 / 9); None, or one not narrower than the screen, puts it in the screen's corners. A taller canvas
+    always has the HUD at the top and bottom edges."""
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in (width, height)):
+        raise ValueError('canvas dimensions must be positive and finite')
+    if hud_aspect is not None:
+        if not math.isfinite(hud_aspect) or hud_aspect < 16 / 9:
+            raise ValueError('HUD aspect must be finite and at least 16:9')
+        # Runtime treats caps within one percent of the canvas as full width.
+        if hud_aspect >= width / height * 0.99: hud_aspect = None
     wide = width / height > 16 / 9
     k = (16 / 9) / (width / height) if wide else (width / height) / (16 / 9)
     assert k < 1, 'only for canvases of another shape than 16:9'
     root_scale = 'scale_x' if wide else 'scale_y'
     changed, layouts = set(), {}
-    unknown = sorted(n for n in KEEP_ROOT if f'blyt/{n}.bflyt' not in members)
-    if unknown: raise SystemExit(f'KEEP_ROOT names no layout: {unknown}')
+    unknown = sorted(n for n in KEEP_ROOT | MARKER_ROOT.keys() if f'blyt/{n}.bflyt' not in members)
+    if unknown: raise SystemExit(f'KEEP_ROOT or MARKER_ROOT names no layout: {unknown}')
     def pane_offset(layout, pane):
         member = f'blyt/{layout}.bflyt'
         if member not in members: raise SystemExit(f'{layout}: no layout {member} in the archive')
@@ -232,13 +286,21 @@ def apply(blarc, members, width, height, hud_corner=True):
         return find_pane(layouts[member], layout, pane)
     for member in sorted(m for m in members if m.startswith('blyt/') and m.endswith('.bflyt')):
         if member[5:-6] in KEEP_ROOT: continue
+        if member[5:-6] in MARKER_ROOT:   # the root stays at 1, its listed panes take the scale
+            layout = member[5:-6]
+            for pane in ('RootPane',) + MARKER_ROOT[layout]:
+                at = pane_offset(layout, pane) + FIELD[root_scale]
+                have = struct.unpack_from('<f', blarc, at)[0]
+                if abs(abs(have) - 1.0) > 1e-3: raise SystemExit(f'{layout} {pane} {root_scale}: {have}, expected ±1.0')
+                if pane != 'RootPane': struct.pack_into('<f', blarc, at, k * have)   # mirrored panes stay mirrored
+            continue
         at = pane_offset(member[5:-6], 'RootPane') + FIELD[root_scale]
         have = struct.unpack_from('<f', blarc, at)[0]
         if abs(have - 1.0) > 1e-3: raise SystemExit(f'{member[5:-6]} RootPane {root_scale}: {have}, expected 1.0')
         struct.pack_into('<f', blarc, at, k)
     # Every edit's value at k = 1 is the value the game ships (a scale of 1, the 16:9 position): checked before writing,
     # so a version with other numbers stops here instead of getting wrong positions. OFF moves a pane away: not checked.
-    table = zip(edits(k, hud_corner), edits(1.0, hud_corner)) if wide else zip(tall_edits(k), tall_edits(1.0))
+    table = zip(edits(k, hud_aspect), edits(1.0, hud_aspect)) if wide else zip(tall_edits(k), tall_edits(1.0))
     for (layout, pane, field, value), (_, _, _, shipped) in table:
         at = pane_offset(layout, pane) + FIELD[field]
         have = struct.unpack_from('<f', blarc, at)[0]
@@ -247,7 +309,7 @@ def apply(blarc, members, width, height, hud_corner=True):
     if not wide:
         tall_anim(blarc, members, k, changed)
         return sorted(changed)
-    for anim, offset, shipped, value in anim_edits(k, hud_corner):
+    for anim, offset, shipped, value in anim_edits(k, hud_aspect):
         member = f'anim/{anim}.bflan'
         if member not in members: raise SystemExit(f'{anim}: no animation {member} in the archive')
         lo, hi = members[member]

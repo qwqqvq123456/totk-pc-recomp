@@ -12,6 +12,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "amiibo.h"
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
@@ -25,6 +26,7 @@
 
 #define CHILD_ENV "TOTK_PROBE_SERVICES_CHILD"
 #define TRY_WAIT_SYSTEM_EVENT "_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE"
+#define DESTROY_SYSTEM_EVENT "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"
 
 typedef struct { const char *key, *name; int fatal; uint64_t addr; int bound, calls; } Ov;
 static Ov ovs[] = {
@@ -242,6 +244,12 @@ static char *lang(void) {
 }
 
 static void set_env(const char *name, const char *value) { plat_setenv(name, value); }   // NULL removes it
+// A live setting read through a cfg_version cache: the environment wins, and the cfg_set (empty = the default) moves
+// the version so the cache reads it again.
+static void set_live(const char *name, const char *value) {
+    set_env(name, value);
+    cfg_set(name, value ? value : "");
+}
 
 static void probe_oe(void) {
     char *keep_lang = cfg_get("TOTK_LANG") ? strdup(cfg_get("TOTK_LANG")) : NULL;
@@ -386,6 +394,43 @@ static void probe_applet(void) {
     CHECK(event_works(activate, 0), "the nfp activate event is set without an amiibo on the reader");
     CHECK((uint32_t)CALL("nfp.StartDetection", U(handles)) == 0, "nfp StartDetection");
     CHECK((uint32_t)CALL("nfp.StopDetection", U(handles)) == 0, "nfp StopDetection");
+    // The game attaches again before each detection: DestroySystemEvent on the attached event, then Attach* on the
+    // same SystemEventType. Both events must work again afterwards.
+    static uint64_t destroy;
+    if (!destroy && !(destroy = ldr_symbol(DESTROY_SYSTEM_EVENT))) rt_fatal("probe-services: no %s", DESTROY_SYSTEM_EVENT);
+    rt_call(gc, destroy, 1, activate);
+    rt_call(gc, destroy, 1, deactivate);
+    CHECK(CALL("nfp.AttachActivateEvent", activate, U(handles)) == 0, "nfp AttachActivateEvent again");
+    CHECK(CALL("nfp.AttachDeactivateEvent", deactivate, U(handles)) == 0, "nfp AttachDeactivateEvent again");
+    int reattached = event_works(activate, 0) && event_works(deactivate, 0);
+    CHECK(reattached, "the nfp events do not work after DestroySystemEvent and a second Attach");
+    CHECK((uint32_t)CALL("nfp.StartDetection", U(handles)) == 0, "nfp StartDetection again");
+    // An amiibo's NTAG215 header: UID with its two check bytes, static lock 0F E0, capability container F1 10 FF EE.
+    // The loader takes it and refuses the same file with a plain NDEF container (E1).
+    static const uint8_t head[16] = {0x04, 0x11, 0x22, 0x88 ^ 0x04 ^ 0x11 ^ 0x22, 0x33, 0x44, 0x55, 0x66,
+                                     0x33 ^ 0x44 ^ 0x55 ^ 0x66, 0x48, 0x0F, 0xE0, 0xF1, 0x10, 0xFF, 0xEE};
+    uint8_t dump[AMIIBO_DUMP_SIZE] = {0};
+    memcpy(dump, head, sizeof head);
+    // Link (Archer): character 0x0100, variant 0, figure type 0, model number 0x0353, series 9, format 02
+    static const uint8_t id[8] = {0x01, 0x00, 0x00, 0x00, 0x03, 0x53, 0x09, 0x02};
+    memcpy(dump + 0x54, id, sizeof id);
+    const char *dump_path = "probe-amiibo.bin";
+    int amiibo_ok = plat_file_write(dump_path, dump, sizeof dump) && amiibo_load_file(dump_path);
+    // TagInfo carries the 7-byte UID without its check byte; ModelInfo has the series at 3, the model number
+    // little-endian at 4 and the figure type at 6
+    uint8_t ti[0x58], mi[0x40];
+    amiibo_get_tag_info(ti);
+    amiibo_get_model_info(mi);
+    static const uint8_t want_uid[7] = {0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    static const uint8_t want_model[7] = {0x01, 0x00, 0x00, 0x09, 0x53, 0x03, 0x00};
+    CHECK(amiibo_ok && !memcmp(ti, want_uid, 7) && ti[0x0A] == 7, "amiibo TagInfo UID %02x %02x %02x %02x %02x %02x %02x",
+          ti[0], ti[1], ti[2], ti[3], ti[4], ti[5], ti[6]);
+    CHECK(amiibo_ok && !memcmp(mi, want_model, 7), "amiibo ModelInfo %02x %02x %02x %02x %02x %02x %02x", mi[0], mi[1],
+          mi[2], mi[3], mi[4], mi[5], mi[6]);
+    dump[0x0C] = 0xE1;
+    amiibo_ok = amiibo_ok && plat_file_write(dump_path, dump, sizeof dump) && !amiibo_load_file(dump_path);
+    plat_fs_unlink(dump_path);
+    CHECK(amiibo_ok, "the amiibo loader refuses a dump with the amiibo capability container, or takes a plain NDEF one");
     CHECK(CALL("nfp.Finalize", 0) == 0 && (uint32_t)CALL("nfp.GetState", 0) == 0, "nfp finalize");
     CALL("err.ShowError", 0x2a8);
     CALL("nndiagStartup", 0);
@@ -395,7 +440,8 @@ static void probe_applet(void) {
     CALL("pctl.Initialize", 0);
     CALL("diag.InitializeApplicationAbortObserver", 0);
     printf("applet/prepo/nfp/err: launch parameter none, volume balance, play reports local, an NFC reader without "
-           "an amiibo, availability event (bound through the SDK's CreateSystemEvent) %s\n", nfp_event ? "ok" : "FAILED");
+           "an amiibo, availability event (bound through the SDK's CreateSystemEvent) %s, activate and deactivate events "
+           "destroyed and attached again %s\n", nfp_event ? "ok" : "FAILED", reattached ? "ok" : "FAILED");
 }
 
 static void probe_account(void) {
@@ -483,6 +529,26 @@ static void probe_time(void) {
 static int near3(const float *v, double x, double y, double z, double tol) {
     return fabs(v[0] - x) <= tol && fabs(v[1] - y) <= tol && fabs(v[2] - z) <= tol;
 }
+// A gyro sample: rate plus noise. Uniform noise of half-width amp from a fixed LCG, so every run reads the same.
+static void noisy(const double rate[3], double amp, uint32_t *seed, double out[3]) {
+    for (int i = 0; i < 3; i++) {
+        *seed = *seed * 1664525u + 1013904223u;
+        out[i] = rate[i] + amp * ((double)(*seed >> 8) / (1 << 24) * 2 - 1);
+    }
+}
+
+// Feed secs of samples at the sensor thread's 4 ms; returns the yaw (angle z, revolutions) the last state reads.
+static double feed_for(MotionFusion *m, const double acc[3], const double rate[3], double amp, uint32_t *seed,
+                       double secs, uint64_t *t) {
+    MotionState s;
+    double g[3];
+    for (int i = 0; i < (int)(secs * 250 + 0.5); i++) {
+        noisy(rate, amp, seed, g);
+        motion_feed(m, acc, g, *t += 4000000);
+    }
+    return motion_read(m, &s, 1, *t + 1000000) == 1 ? s.angle[2] : NAN;
+}
+
 static int at_rest(const MotionState *s) {
     return !s->attributes && !s->sampling && near3(s->acc, 0, 0, -1, 0) && near3(s->gyro, 0, 0, 0, 0) &&
            near3(s->dir, 1, 0, 0, 0) && near3(s->dir + 3, 0, 1, 0, 0) && near3(s->dir + 6, 0, 0, 1, 0);
@@ -578,6 +644,124 @@ static void probe_feedback(uint32_t pid, uint32_t style) {
           near3(ms[0].dir, 1, 0, 0, 0.01),
           "fusion restart: %d states in the frame of the Start, %d after one sample (sampling %lld, angle %.4f rev)", same,
           next, (long long)ms[0].sampling, (double)ms[0].angle[2]);
+    // Gyro bias calibration on the private instance (not written to totk.ini): a large steady bias with resting noise
+    // is measured and then subtracted, so a resting controller reads no rotation and its yaw holds; samples that swing
+    // (the controller moved) are rejected and leave the measured bias in effect; an attempt without samples times out.
+    const double bias[3] = {-0.031, -0.011, -0.141};
+    double g[3];
+    motion_calibrate_start(m, "probe pad", t);
+    for (int i = 0; i < 375; i++) {
+        for (int j = 0; j < 3; j++) g[j] = bias[j] + (i & 1 ? 0.01 : -0.01);
+        motion_feed(m, down, g, t += 4000000);
+    }
+    int done = motion_calib_poll(m, t);
+    for (int i = 0; i < 250; i++) motion_feed(m, down, bias, t += 4000000);
+    motion_read(m, ms, 1, t + 1000000);
+    CHECK(done == MOTION_CALIB_DONE && near3(ms[0].gyro, 0, 0, 0, 1e-4) && fabs(ms[0].angle[2]) < 1e-3 &&
+          near3(ms[0].dir, 1, 0, 0, 0.001),
+          "calibration: state %d, resting gyro %.5f %.5f %.5f rev/s, yaw %.5f rev after 1 s", done,
+          (double)ms[0].gyro[0], (double)ms[0].gyro[1], (double)ms[0].gyro[2], (double)ms[0].angle[2]);
+    motion_calibrate_start(m, "probe pad", t);
+    for (int i = 0; i < 375; i++) {
+        for (int j = 0; j < 3; j++) g[j] = bias[j] + (j == 0 && (i & 1) ? 0.2 : 0);
+        motion_feed(m, down, g, t += 4000000);
+    }
+    int moved = motion_calib_poll(m, t);
+    motion_feed(m, down, bias, t += 4000000);
+    motion_read(m, ms, 1, t + 1000000);
+    CHECK(moved == MOTION_CALIB_MOVED && near3(ms[0].gyro, 0, 0, 0, 1e-4),
+          "calibration of a moving controller: state %d, resting gyro %.5f %.5f %.5f rev/s", moved,
+          (double)ms[0].gyro[0], (double)ms[0].gyro[1], (double)ms[0].gyro[2]);
+    motion_bias_reset(m);
+    motion_calibrate_start(m, "probe pad", t);
+    int waiting = motion_calib_poll(m, t + 1000000000ull), failed = motion_calib_poll(m, t + 6000000000ull);
+    motion_feed(m, down, bias, t += 4000000);
+    motion_read(m, ms, 1, t + 1000000);
+    CHECK(waiting == MOTION_CALIB_COLLECTING && failed == MOTION_CALIB_FAILED &&
+          fabs(ms[0].gyro[2] - bias[2] / (2 * M_PI)) < 1e-6,
+          "calibration without samples: state %d after 1 s, %d after 6 s; after a reset the raw gyro passes", waiting,
+          failed);
+    // A sensor just switched on reads zero: the frame starts at the first reading, here standing on the bottom edge
+    // (controller y up). Then the down is wrong by a quarter turn (laid flat without turning): a second held still
+    // levels it to within 8 degrees.
+    MotionFusion *u = motion_new();
+    const double standing[3] = {0, -1, 0};
+    motion_feed(u, still, still, t);
+    int before = motion_read(u, ms, 16, t + 1000000);
+    motion_feed(u, standing, still, t += 4000000);
+    int first = motion_read(u, ms, 16, t + 1000000);
+    int upright_y = first == 1 && near3(ms[0].dir + 3, 0, 0, 1, 0.01);
+    for (int i = 0; i < 250; i++) motion_feed(u, down, still, t += 4000000);
+    motion_read(u, ms, 16, t + 1000000);
+    CHECK(before == 0 && upright_y && ms[0].dir[8] > 0.99,
+          "fusion start and levelling: %d states before a reading, %d after (y up %d), z up %.3f after 1 s still",
+          before, first, upright_y, (double)ms[0].dir[8]);
+
+    // Drift at rest (gyro_auto_bias). Table noise is +-0.006 rad/s, a hand's +-0.03; drift is the yaw rate a
+    // controller lying still reads, in rad/s, over the 10 s after the tracker had 10 s to learn.
+    char *keep_auto = cfg_get("TOTK_GYRO_AUTO_BIAS") ? strdup(cfg_get("TOTK_GYRO_AUTO_BIAS")) : NULL;
+    char *keep_cal = cfg_get("TOTK_GYRO_CALIBRATION") ? strdup(cfg_get("TOTK_GYRO_CALIBRATION")) : NULL;
+    set_live("TOTK_GYRO_CALIBRATION", "1");
+    const double drift_b[3] = {0.02, -0.03, 0.05}, rev = 2 * M_PI;
+    uint32_t seed = 1;
+    double drift_rate[2];
+    for (int on = 0; on < 2; on++) {
+        set_live("TOTK_GYRO_AUTO_BIAS", on ? "1" : "0");
+        MotionFusion *d = motion_new();
+        uint64_t td = t;
+        feed_for(d, down, drift_b, 0.006, &seed, 10, &td);
+        double y0 = feed_for(d, down, drift_b, 0.006, &seed, 0.004, &td);
+        drift_rate[on] = (feed_for(d, down, drift_b, 0.006, &seed, 10, &td) - y0) * rev / 10;
+    }
+    CHECK(fabs(drift_rate[0] - drift_b[2]) < 0.002 && fabs(drift_rate[1]) < 0.001,
+          "drift at rest: yaw %.5f rad/s with gyro_auto_bias off, %.5f on (bias %.3f)", drift_rate[0], drift_rate[1],
+          drift_b[2]);
+    // The #1267 case: calibrated, then the bias moved by 0.01 rad/s (the controller warmed up). The tracker takes the
+    // remainder on top of the calibrated bias, and a new calibration starts it over.
+    MotionFusion *c = motion_new();
+    uint64_t tc = t;
+    motion_calibrate_start(c, "probe pad", tc);
+    feed_for(c, down, drift_b, 0.006, &seed, 1.6, &tc);
+    int cal = motion_calib_poll(c, tc);
+    const double warm[3] = {drift_b[0], drift_b[1], drift_b[2] - 0.01};
+    double c0 = feed_for(c, down, warm, 0.006, &seed, 0.004, &tc);
+    double c_early = (feed_for(c, down, warm, 0.006, &seed, 0.5, &tc) - c0) * rev / 0.5;
+    feed_for(c, down, warm, 0.006, &seed, 10, &tc);
+    c0 = feed_for(c, down, warm, 0.006, &seed, 0.004, &tc);
+    double c_late = (feed_for(c, down, warm, 0.006, &seed, 10, &tc) - c0) * rev / 10;
+    CHECK(cal == MOTION_CALIB_DONE && fabs(c_early + 0.01) < 0.002 && fabs(c_late) < 0.001,
+          "drift after calibration: state %d, yaw %.5f rad/s right after, %.5f once learned", cal, c_early, c_late);
+    // In the hand: a slow aim, 0.05 rad/s (3 deg/s) of yaw with a hand's noise, for 10 s. Nothing is learned from it,
+    // so the full turn reaches the game.
+    MotionFusion *h = motion_new();
+    uint64_t th = t;
+    const double pan[3] = {0, 0, 0.05};
+    double h0 = feed_for(h, down, pan, 0.03, &seed, 0.004, &th);
+    double turned = (feed_for(h, down, pan, 0.03, &seed, 10, &th) - h0) * rev;
+    CHECK(fabs(turned - 0.5) < 0.01, "slow aim in the hand: %.4f rad of the 0.5 turned", turned);
+    // Levelling and drift together: the frame starts standing on the bottom edge, then the controller lies flat with
+    // a bias on every axis. The bias tilts the fused down by bias / gain (0.05 / 4 rad, 0.7 degrees) until it is
+    // learned; then the down is level, and yaw holds.
+    MotionFusion *l = motion_new();
+    uint64_t tl = t;
+    feed_for(l, standing, drift_b, 0.006, &seed, 0.004, &tl);
+    feed_for(l, down, drift_b, 0.006, &seed, 1, &tl);
+    motion_read(l, ms, 1, tl + 1000000);
+    double up_1s = ms[0].dir[8];
+    feed_for(l, down, drift_b, 0.006, &seed, 10, &tl);
+    double l0 = feed_for(l, down, drift_b, 0.006, &seed, 0.004, &tl);
+    double l_rate = (feed_for(l, down, drift_b, 0.006, &seed, 10, &tl) - l0) * rev / 10;
+    motion_read(l, ms, 1, tl + 1000000);
+    CHECK(up_1s > 0.99 && ms[0].dir[8] > 0.99999 && fabs(l_rate) < 0.001,
+          "levelling with drift: z up %.5f after 1 s, %.6f after 21 s, yaw %.5f rad/s", up_1s, (double)ms[0].dir[8],
+          l_rate);
+    printf("hid drift at rest: yaw %.5f rad/s off, %.5f on; after calibration %.5f, then %.5f; slow aim %.4f of 0.5 "
+           "rad; levelled z %.5f, yaw %.5f rad/s\n",
+           drift_rate[0], drift_rate[1], c_early, c_late, turned, up_1s, l_rate);
+    set_live("TOTK_GYRO_AUTO_BIAS", keep_auto);
+    set_live("TOTK_GYRO_CALIBRATION", keep_cal);
+    free(keep_auto);
+    free(keep_cal);
     printf("hid feedback: vibration handles %#x %#x, six-axis %#x, at rest when stopped; fusion quarter turn %.4f rev\n",
            vh[0], vh[1], sh[0], quarter);
 }
@@ -818,11 +1002,14 @@ static void probe_fonts(void) {
     CHECK(got == sizeof head && size && size + 8 == (uint64_t)len, "shared font 0: size %llu, file %lld bytes",
           (unsigned long long)size, (long long)len);
     const uint8_t *p = (const uint8_t *)(uintptr_t)addr;
-    CHECK(addr && !memcmp(p - 8, head, sizeof head) && ov_bfttf_size(p - 8, size + 8) == size,
-          "shared font 0: the address is not 8 bytes into the BFTTF file");
+    // The pl shared memory layout: the file's BFTTF header unchanged at Address - 8, the decoded sfnt font at Address.
+    CHECK(addr && !memcmp(p - 8, head, 8) && ov_bfttf_size(head, size + 8) == size,
+          "shared font 0: the address is not 8 bytes past the file's BFTTF header");
+    CHECK(!memcmp(p, "\0\1\0\0", 4) || !memcmp(p, "OTTO", 4),
+          "shared font 0: the data at the address is not plain sfnt: %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
     CHECK(CALL("pl.GetSharedFontAddress", 0) == addr, "shared font 0: the address changed");
-    printf("pl: shared font 0 (Standard) at %#llx, %llu bytes, BFTTF header checked (%s)\n", (unsigned long long)addr,
-           (unsigned long long)size, path);
+    printf("pl: shared font 0 (Standard) at %#llx, %llu bytes, BFTTF header and decoded sfnt checked (%s)\n",
+           (unsigned long long)addr, (unsigned long long)size, path);
 }
 
 // The host catalog (ui_text.c): every menu id has its own English, Russian, Brazilian Portuguese and Simplified
@@ -849,15 +1036,33 @@ static void probe_menu_text(void) {
     CHECK(!strcmp(ui_text_in("ru", UI_SWKBD_OK), "ОК") && !strcmp(ui_text_in("de", UI_SWKBD_CANCEL), "Abbrechen") &&
           !strcmp(ui_text_in("en", UI_SWKBD_OK), "OK"), "keyboard texts changed");
     // language names: the same string in every row
-    for (int id = UI_MENU_LANGNAME_EN; id <= UI_MENU_LANGNAME_PT_BR; id++)
+    for (int id = UI_MENU_LANGNAME_EN; id <= UI_MENU_LANGNAME_ES_419; id++)
         for (size_t i = 1; i < sizeof langs / sizeof *langs; i++)
             CHECK(!strcmp(ui_text_in(langs[i], (UiTextId)id), ui_text_in("en", (UiTextId)id)), "language name %d differs in %s", id, langs[i]);
     CHECK(!strcmp(ui_text_in("en", UI_MENU_LANGNAME_RU), "Русский"), "Russian is not shown as Russian");
+    // game language list: pt-BR only where the build ships USpt; the Switch variants are entries of their own
+    {
+        UiGameLang gl[16];
+        int n121 = ui_text_game_langs(121, gl, 16), has[16] = {0};
+        for (int i = 0; i < n121; i++) CHECK(strcmp(gl[i].code, "pt-BR"), "1.2.1 game language list offers pt-BR");
+        int n143 = ui_text_game_langs(143, gl, 16), pt = 0;
+        for (int i = 0; i < n143; i++) {
+            pt |= !strcmp(gl[i].code, "pt-BR");
+            for (int j = 0; j < i; j++) CHECK(strcmp(gl[i].code, gl[j].code), "duplicate game language %s", gl[i].code);
+        }
+        CHECK(pt && n143 == n121 + 1, "1.4.3 game language list lacks pt-BR");
+        static const char *const want[] = {"en-GB", "fr-CA", "es-419"};
+        for (int w = 0; w < 3; w++)
+            for (int i = 0; i < n143; i++) has[w] |= !strcmp(gl[i].code, want[w]);
+        CHECK(has[0] && has[1] && has[2], "game language list lacks en-GB, fr-CA or es-419");
+    }
     // the overlay formats keep their conversions
-    CHECK(strstr(ui_text_in("ru", UI_MENU_OV_GAME_PCT), "%.0f%%") && strstr(ui_text_in("ru", UI_MENU_OV_MAX_MS), "%.1f"),
+    CHECK(strstr(ui_text_in("ru", UI_MENU_OV_GAME_PCT), "%.0f%%") && strstr(ui_text_in("ru", UI_MENU_OV_MAX_MS), "%.1f") &&
+          strstr(ui_text_in("ru", UI_MENU_OV_LOW1), "%.0f") && strstr(ui_text_in("ru", UI_MENU_OV_LOW01), "%.0f"),
           "overlay format lost its conversion");
     CHECK(strstr(ui_text_in("pt-BR", UI_MENU_OV_GAME_PCT), "%.0f%%") &&
-          strstr(ui_text_in("pt-BR", UI_MENU_OV_MAX_MS), "%.1f"), "pt-BR overlay format lost its conversion");
+          strstr(ui_text_in("pt-BR", UI_MENU_OV_MAX_MS), "%.1f") &&
+          strstr(ui_text_in("pt-BR", UI_MENU_OV_LOW1), "%.0f") && strstr(ui_text_in("zh-Hans", UI_MENU_OV_LOW01), "%.0f"), "pt-BR overlay format lost its conversion");
     // a Brazilian game language gets the Brazilian keyboard row, Portugal's Portuguese keeps its own
     CHECK(!strcmp(ui_text_lang("pt-BR"), "pt-BR") && !strcmp(ui_text_lang("pt"), "pt") &&
           strcmp(ui_text_in("pt-BR", UI_SWKBD_PROMPT), ui_text_in("pt", UI_SWKBD_PROMPT)), "pt-BR keyboard row not used");
@@ -871,8 +1076,14 @@ static void probe_menu_text(void) {
     cfg_set("TOTK_MENU_LANG", "zh-Hans");
     CHECK(menu_text(UI_MENU_TITLE) == ui_text_in("zh-Hans", UI_MENU_TITLE), "menu_text ignores MENU_LANG=zh-Hans");
     cfg_set("TOTK_MENU_LANG", "");
+    // the system language as ui_text.c resolve_menu_lang takes it: the tag, else its base language (ru-RU: ru), else en
     const char *sys_lang = ui_text_lang(plat_ui_language());
-    const char *auto_lang = ui_text_defined(sys_lang, UI_MENU_TITLE) ? sys_lang : "en";
+    char sys_base[16] = "";
+    size_t base_n = strcspn(sys_lang, "-");
+    if (sys_lang[base_n] && base_n < sizeof sys_base) memcpy(sys_base, sys_lang, base_n);
+    const char *auto_lang = ui_text_defined(sys_lang, UI_MENU_TITLE) ? sys_lang
+                            : *sys_base && ui_text_defined(sys_base, UI_MENU_TITLE) ? sys_base
+                                                                                      : "en";
     CHECK(menu_text(UI_MENU_CONTINUE) == ui_text_in(auto_lang, UI_MENU_CONTINUE), "menu_text auto ignores the system language");
 }
 

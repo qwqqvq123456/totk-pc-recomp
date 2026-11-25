@@ -13,6 +13,7 @@
 #include "input_win.h"
 #include "input_map.h"
 #include "input_wsys.h"
+#include "gameplay_tweaks.h"
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
@@ -83,6 +84,9 @@ uint32_t input_key_char(int key) {
 
 // ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
+static volatile LONG mouse_travel;          // raw counts moved in total, captured or not (ikb_mouse_travel)
+static volatile LONG mouse_wheel;           // wheel turned while captured or over the window, in WHEEL_DELTA units
+                                           // (ikb_wheel_take)
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
 // Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
@@ -116,7 +120,41 @@ static void cursor_update(HWND h) {
         if (cur_captured) ClipCursor(NULL);
         InterlockedExchange(&cur_captured, 0);
     }
+    if (!cur_captured) gameplay_tweaks_reset();
     ReleaseSRWLockExclusive(&cur_lock);
+}
+
+// The pointer shown over the client area while the cursor is not captured (cursor_art.c), 32 pixels at 96 DPI and
+// larger with the window's DPI; made again when the DPI changes. Window thread. NULL when Windows refuses it: the
+// window class's arrow stays.
+static HCURSOR art_cursor(HWND h) {
+    static HCURSOR cur;
+    static UINT made_dpi;
+    UINT dpi = GetDpiForWindow(h);
+    if (!dpi) dpi = USER_DEFAULT_SCREEN_DPI;
+    if (cur && dpi == made_dpi) return cur;
+    int size = MulDiv(32, (int)dpi, USER_DEFAULT_SCREEN_DPI), hot;
+    size = size < 32 ? 32 : size > 128 ? 128 : size;
+    BITMAPV5HEADER bh = {.bV5Size = sizeof bh, .bV5Width = size, .bV5Height = -size, .bV5Planes = 1, .bV5BitCount = 32,
+                         .bV5Compression = BI_BITFIELDS, .bV5RedMask = 0xff0000, .bV5GreenMask = 0xff00,
+                         .bV5BlueMask = 0xff, .bV5AlphaMask = 0xff000000u};
+    void *bits = NULL;
+    HDC dc = GetDC(NULL);
+    HBITMAP color = CreateDIBSection(dc, (BITMAPINFO *)&bh, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, dc);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, NULL);
+    HCURSOR made = NULL;
+    if (color && mask && bits) {
+        cursor_art(bits, size, &hot);
+        ICONINFO ii = {.fIcon = FALSE, .xHotspot = (DWORD)hot, .yHotspot = (DWORD)hot, .hbmMask = mask,
+                       .hbmColor = color};
+        made = (HCURSOR)CreateIconIndirect(&ii);
+    }
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    if (!made) return cur;   // the old size, or NULL
+    cur = made, made_dpi = dpi;   // the old one may still be on screen: kept (a DPI change is rare)
+    return cur;
 }
 
 int input_cursor_released(void) { return (cur_rel & CUR_REL) != 0; }
@@ -137,15 +175,36 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_INPUT: {
         RAWINPUT ri;
         UINT sz = sizeof ri;
-        if (cur_captured && GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+        if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
             ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
-            InterlockedAdd(&mouse_dx, ri.data.mouse.lLastX);
-            InterlockedAdd(&mouse_dy, ri.data.mouse.lLastY);
+            LONG x = ri.data.mouse.lLastX, y = ri.data.mouse.lLastY;
+            InterlockedAdd(&mouse_travel, (x < 0 ? -x : x) + (y < 0 ? -y : y));
+            if (cur_captured) {
+                InterlockedAdd(&mouse_dx, x);
+                InterlockedAdd(&mouse_dy, y);
+            }
         }
+        // The wheel comes in the same message (usButtonData, signed, + away from the player). It counts while the
+        // cursor is captured, or released over the client area: a game menu with the pointer (menu_cursor.c) takes it
+        // as steps of its focus. input.c drops the notches where nothing takes them.
+        float px, py;
+        if (ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) &&
+            (cur_captured || ikb_pointer(&px, &py)))
+            InterlockedAdd(&mouse_wheel, (SHORT)ri.data.mouse.usButtonData);
         break;   // DefWindowProc must see WM_INPUT for cleanup
     }
+    case WM_MOUSEWHEEL:
+        if (input_gameplay_active())
+            gameplay_tweaks_wheel(-(double)(short)HIWORD(w) / WHEEL_DELTA,
+                                  ikb_down(KEY_C), ikb_down(KEY_MOUSE_R));
+        break;
     case WM_SETCURSOR:
-        if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
+        if (LOWORD(l) == HTCLIENT) {
+            // pointer_image = 1: the pointer of cursor_art.c in place of the window class's arrow (0, the default:
+            // the arrow, left to DefWindowProc)
+            HCURSOR c = cur_captured || !cfg_bool("TOTK_POINTER_IMAGE") ? NULL : art_cursor(h);
+            if (cur_captured || c) { SetCursor(c); *res = TRUE; return 1; }
+        }
         break;
     case WM_SYSCOMMAND:   // Alt pressed alone would enter the window menu loop, which stalls the game: Alt is a game key
         if ((w & 0xFFF0) == SC_KEYMENU && l == 0) { *res = 0; return 1; }
@@ -203,9 +262,39 @@ int ikb_escape(void) { return key_down(VK_ESCAPE); }
 
 int ikb_captured(void) { return cur_captured != 0; }
 
+int ikb_pointer(float *nx, float *ny) {
+    HWND h = gfx_window_handle();
+    RECT r;
+    POINT p;
+    if (!h || GetForegroundWindow() != h || !GetClientRect(h, &r) || r.right < 1 || r.bottom < 1 || !GetCursorPos(&p) ||
+        !ScreenToClient(h, &p))
+        return 0;
+    *nx = (float)p.x / (float)r.right, *ny = (float)p.y / (float)r.bottom;
+    return p.x >= 0 && p.y >= 0 && p.x < r.right && p.y < r.bottom;
+}
+
+void ikb_pointer_set(float nx, float ny) {
+    HWND h = gfx_window_handle();
+    RECT r;
+    if (!h || GetForegroundWindow() != h || !GetClientRect(h, &r)) return;
+    POINT p = {(LONG)(nx * r.right), (LONG)(ny * r.bottom)};
+    if (ClientToScreen(h, &p)) SetCursorPos(p.x, p.y);
+}
+
+uint32_t ikb_mouse_travel(void) { return (uint32_t)mouse_travel; }
+
 void ikb_mouse_take(int32_t *dx, int32_t *dy) {
     *dx = InterlockedExchange(&mouse_dx, 0);
     *dy = InterlockedExchange(&mouse_dy, 0);
+}
+
+int32_t ikb_wheel_take(void) {
+    LONG o, n;
+    do {
+        o = mouse_wheel;
+        n = o % WHEEL_DELTA;   // the part of a notch stays for the next call
+    } while (InterlockedCompareExchange(&mouse_wheel, n, o) != o);
+    return (int32_t)(o / WHEEL_DELTA);
 }
 
 void ikb_cursor_update(void) { cursor_update(gfx_window_handle()); }

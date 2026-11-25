@@ -22,9 +22,11 @@
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -32,6 +34,7 @@
 
 #include <SDL3/SDL_clipboard.h>
 
+#include "cfg.h"
 #include "platform.h"
 
 // The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h), for headers older than it: the release
@@ -268,7 +271,8 @@ int plat_intr_resume(PlatIntr *t, uint64_t to) {
 // ---- fibers: a stack switch of our own. glibc's swapcontext saves and restores the signal mask with a system call
 // on every switch, and the game switches fibers often. fiber_swap saves the callee-saved registers, the MXCSR and the
 // x87 control word on the current stack, stores the stack pointer in *save and loads the other one. A new fiber's
-// stack is laid out as fiber_swap leaves one, returning into fiber_entry, which calls fn(arg) (r12 and r13).
+// stack is laid out as fiber_swap leaves one, returning into fiber_entry, which realigns the stack and calls fn(arg)
+// (r12 and r13).
 struct PlatFiber {
     void *sp;
     void *stack;   // mapped stack (NULL for a thread's own context)
@@ -310,6 +314,11 @@ __asm__(".text\n"
         ".type plat_fiber_entry, @function\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
+        // fiber_swap's ret lands here with rsp = top - 8, as at the entry of a called function. The call below must
+        // be made with rsp 16-byte aligned so that fn starts with rsp = 8 mod 16, as the System V ABI demands; without
+        // the realignment every 16-byte local of fn is off by 8, which the VEX instructions of a v3 build tolerate
+        // but the SSE ones of a v2 or k10 build (movdqa, pcmpeqb with a memory operand) fault on.
+        "    andq $-16, %rsp\n"
         "    movq %r13, %rdi\n"
         "    callq *%r12\n"
         "    ud2\n"
@@ -472,6 +481,14 @@ uint64_t plat_counter_hz(void) { return 1000000000u; }
 // The timer slack (50 us by default) is how late the kernel may wake a sleeping thread to batch wakeups. New threads
 // inherit it from the thread that creates them.
 void plat_timer_1ms(void) { prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0); }
+
+int plat_power_full(void) { return -1; }
+
+int plat_perf_core_setup(char *why, size_t n) {
+    snprintf(why, n, "not done on Linux");
+    return 0;
+}
+int plat_thread_perf_core(void) { return -1; }
 
 // clock_nanosleep wakes within the timer slack (50 us by default) of its deadline; the last PLAT_SPIN_NS are spent
 // yielding so the deadline is met closely, as on Windows.
@@ -916,8 +933,9 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 // One handler for the synchronous faults. A SIGSEGV whose page-fault error code has the write bit set goes to the
-// write-fault hook first (memory.c thaws a frozen region); a fault in this executable's code then goes to the crash
-// hook (main.c); anything else gets the default action. Runs on the thread's signal stack.
+// write-fault hook first (memory.c thaws a frozen region); any other fault, in this executable or in a library (Mesa,
+// SDL), then goes to the crash hook (main.c), which reports it and ends the process. Without a crash hook the fault
+// gets the default action. Runs on the thread's signal stack.
 static int (*fault_hook)(uint64_t addr);
 static void (*crash_fn)(const PlatCrash *c);
 
@@ -927,12 +945,23 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
     uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
     Dl_info at, self;
-    if (crash_fn && dladdr((void *)rip, &at) && dladdr((void *)plat_crash_hook, &self) && at.dli_fbase == self.dli_fbase) {
+    if (crash_fn) {
+        int found = dladdr((void *)rip, &at) && at.dli_fname;
         PlatCrash c = {sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error"
                        : sig == SIGILL ? "illegal instruction" : "arithmetic exception",
-                       (uint32_t)sig, rip, rip - (uintptr_t)self.dli_fbase, -1, 0};
+                       (uint32_t)sig, rip, found ? rip - (uintptr_t)at.dli_fbase : rip, -1, 0};
+        if (!found) {
+            c.module = "";
+        } else if (!dladdr((void *)plat_crash_hook, &self) || at.dli_fbase != self.dli_fbase) {
+            const char *n = strrchr(at.dli_fname, '/');
+            c.module = n ? n + 1 : at.dli_fname;
+        }
         if (sig == SIGSEGV || sig == SIGBUS)
             c.access = (err & 16) ? 8 : (err & 2) ? 1 : 0, c.addr = (uint64_t)(uintptr_t)si->si_addr;
+        static const int gr[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                   REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+        for (int i = 0; i < 16; i++) c.gpr[i] = (uint64_t)u->uc_mcontext.gregs[gr[i]];
+        c.has_regs = 1;
         crash_fn(&c);
     }
     signal(sig, SIG_DFL);   // returns into the faulting instruction, which faults again with the default action
@@ -981,6 +1010,12 @@ void plat_reexec(void) {
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
     struct iovec local = {out, n}, remote = {(void *)(uintptr_t)addr, n};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+
+// Not known before the SDL window exists; the Steam Deck has its own profile (cfg.c)
+int plat_screen_size(int *w, int *h) {
+    (void)w, (void)h;
+    return 0;
 }
 
 int plat_mem_readable(uint64_t addr, uint64_t n) {
@@ -1037,6 +1072,8 @@ const void *plat_file_map(PlatFile *f) {
     void *v = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd_of(f), 0);
     return v == MAP_FAILED ? NULL : v;
 }
+
+int plat_fs_os_error(void) { return errno; }
 
 static int fs_err(int e) {
     switch (e) {
@@ -1214,7 +1251,135 @@ const char *plat_user_locale(void) {
     return tag;
 }
 
-// Noto CJK as the common distributions and SteamOS install it; one collection covers every CJK language.
+// A CJK font for the menu: the file that draws this language on this system.
+//
+// The languages the catalog has (ja, ko, zh-Hans, zh-Hant) are not covered by the font built into the menu, so their
+// glyphs are merged in from a system file. Distributions disagree on where Noto CJK lives, and a sandboxed build
+// (Flatpak, Snap, an AppImage on a host whose fonts are mounted at /run/host/fonts) may have no Noto CJK where the
+// fixed paths expect it while the host still has CJK fonts that would do. So ask fontconfig first: it is the database
+// Tk/Xft and every other Linux toolkit reads, it knows /app/share/fonts, the XDG data dirs, /run/host/fonts and the
+// per-user dirs, and adding a font there is enough -- the menu does not need to learn about it. The fixed
+// distribution paths stay as the fallback for a system without fontconfig, and TOTK_MENU_FONT overrides both.
+//
+// fontconfig is loaded with dlopen rather than linked, so a host without libfontconfig (a bare container) still builds
+// and runs and just takes the fallback. The runtime already links -ldl for the NVIDIA libraries.
+
+static int cjk_lang(const char *lang) {
+    return !strcmp(lang, "ja") || !strcmp(lang, "ko") || !strcmp(lang, "zh-Hans") || !strcmp(lang, "zh-Hant");
+}
+
+// The fontconfig language tag of a catalog language. GL says zh-Hans/zh-Hant, but fontconfig and OpenType name the
+// faces zh-cn/zh-tw (Noto Sans CJK SC is lang=zh-cn), and a pattern naming only zh-hans does not reach it.
+static const char *cjk_lang_tag(const char *lang) {
+    if (!strcmp(lang, "ja")) return "ja";
+    if (!strcmp(lang, "ko")) return "ko";
+    if (!strcmp(lang, "zh-Hans")) return "zh-cn";
+    return "zh-tw";
+}
+
+// The handful of fontconfig calls used here (2.0 ABI, unchanged since). Loaded once, kept for the process: the menu
+// rebuilds its atlas when the window height changes and must not dlopen on every rebuild.
+typedef struct _FcPattern FcPattern;
+typedef struct _FcCharSet FcCharSet;
+typedef struct _FcConfig FcConfig;
+
+typedef struct {
+    int state;   // 0 untried, 1 usable, -1 no fontconfig on this system
+    FcPattern *(*NameParse)(const unsigned char *);
+    void (*PatternDestroy)(FcPattern *);
+    int (*PatternAddCharSet)(FcPattern *, const char *, const FcCharSet *);
+    int (*PatternGetString)(const FcPattern *, const char *, int, unsigned char **);
+    FcCharSet *(*CharSetCreate)(void);
+    int (*CharSetAddChar)(FcCharSet *, unsigned int);
+    void (*CharSetDestroy)(FcCharSet *);
+    FcPattern *(*FontMatch)(FcConfig *, FcPattern *, int *);   // 3 args: (config, pattern, FcResult *)
+    int (*PatternGetCharSet)(const FcPattern *, const char *, int, FcCharSet **);
+    int (*CharSetHasChar)(const FcCharSet *, unsigned int);
+    FcConfig *(*ConfigGetCurrent)(void);
+    int (*Init)(void);
+} Fc;
+
+static Fc fc;
+
+static int fc_load(void) {
+    if (fc.state) return fc.state > 0;
+    void *lib = plat_lib_open("libfontconfig.so.1");
+    if (!lib) lib = plat_lib_open("libfontconfig.so");
+    if (!lib) { fc.state = -1; return 0; }
+    fc.NameParse = (FcPattern *(*)(const unsigned char *))plat_lib_sym(lib, "FcNameParse");
+    fc.PatternDestroy = (void (*)(FcPattern *))plat_lib_sym(lib, "FcPatternDestroy");
+    fc.PatternAddCharSet = (int (*)(FcPattern *, const char *, const FcCharSet *))plat_lib_sym(lib, "FcPatternAddCharSet");
+    fc.PatternGetString = (int (*)(const FcPattern *, const char *, int, unsigned char **))plat_lib_sym(lib, "FcPatternGetString");
+    fc.CharSetCreate = (FcCharSet *(*)(void))plat_lib_sym(lib, "FcCharSetCreate");
+    fc.CharSetAddChar = (int (*)(FcCharSet *, unsigned int))plat_lib_sym(lib, "FcCharSetAddChar");
+    fc.CharSetDestroy = (void (*)(FcCharSet *))plat_lib_sym(lib, "FcCharSetDestroy");
+    fc.FontMatch = (FcPattern *(*)(FcConfig *, FcPattern *, int *))plat_lib_sym(lib, "FcFontMatch");
+    fc.PatternGetCharSet = (int (*)(const FcPattern *, const char *, int, FcCharSet **))plat_lib_sym(lib, "FcPatternGetCharSet");
+    fc.CharSetHasChar = (int (*)(const FcCharSet *, unsigned int))plat_lib_sym(lib, "FcCharSetHasChar");
+    fc.ConfigGetCurrent = (FcConfig *(*)(void))plat_lib_sym(lib, "FcConfigGetCurrent");
+    fc.Init = (int (*)(void))plat_lib_sym(lib, "FcInit");
+    if (!fc.NameParse || !fc.PatternDestroy || !fc.PatternAddCharSet || !fc.PatternGetString || !fc.CharSetCreate ||
+        !fc.CharSetAddChar || !fc.CharSetDestroy || !fc.FontMatch || !fc.ConfigGetCurrent ||
+        !fc.PatternGetCharSet || !fc.CharSetHasChar) {
+        fc.state = -1;
+        return 0;
+    }
+    // FcInit loads the configuration and the font set; FcConfigGetCurrent is NULL before it, and FcFontMatch asserts
+    // on a NULL config. Idempotent, so the second call of a rebuild costs a flag check.
+    if (fc.Init) fc.Init();
+    if (!fc.ConfigGetCurrent()) {
+        fc.state = -1;
+        return 0;
+    }
+    fc.state = 1;
+    return 1;
+}
+
+// The file fontconfig picks for this language, or 0. Asks for the generic CJK-capable family with the language set and
+// one representative character of that language in the charset, so a Latin-only or Japanese face cannot win by default.
+static int fc_font_for(const char *lang, char *out, size_t cap) {
+    static const struct { const char *lang; unsigned int cp; } probe[] = {
+        {"ja", 0x65E5},        // 日
+        {"ko", 0xD55C},        // 한
+        {"zh-Hans", 0x8BBE},   // 设
+        {"zh-Hant", 0x8A2D},   // 設
+    };
+    unsigned int cp = 0;
+    for (size_t i = 0; i < sizeof probe / sizeof *probe; i++)
+        if (!strcmp(probe[i].lang, lang)) cp = probe[i].cp;
+    if (!cp || !fc_load()) return 0;
+    char query[64];
+    snprintf(query, sizeof query, "sans-serif:lang=%s", cjk_lang_tag(lang));
+    FcPattern *pat = fc.NameParse((const unsigned char *)query);
+    if (!pat) return 0;
+    FcCharSet *cs = fc.CharSetCreate();
+    int ok = 0;
+    if (cs) {
+        fc.CharSetAddChar(cs, cp);
+        if (fc.PatternAddCharSet(pat, "charset", cs)) {
+            int result = 0;   // FcResult; FcFontMatch asserts when this pointer is NULL
+            FcPattern *m = fc.FontMatch(fc.ConfigGetCurrent(), pat, &result);
+            unsigned char *file = NULL;
+            if (m) {
+                // fontconfig returns the closest pattern even when nothing covers the character, so check the charset
+                // before trusting it: without this a Latin-only system hands back DejaVu Sans and the menu merges no
+                // glyphs while believing it did.
+                FcCharSet *got = NULL;
+                if (result == 0 /* FcResultMatch */ &&
+                    fc.PatternGetCharSet(m, "charset", 0, &got) == 0 && got && fc.CharSetHasChar(got, cp) &&
+                    fc.PatternGetString(m, "file", 0, &file) == 0 && file)
+                    ok = snprintf(out, cap, "%s", (const char *)file) < (int)cap;
+                fc.PatternDestroy(m);
+            }
+        }
+        fc.CharSetDestroy(cs);
+    }
+    fc.PatternDestroy(pat);
+    return ok;
+}
+
+// See platform.h. TOTK_MENU_FONT names a file to use for every CJK language; then fontconfig; then the fixed paths,
+// which are the normal layout on SteamOS and the distributions that predate fontconfig's own lookup.
 int plat_font_path(const char *lang, char *out, size_t cap) {
     static const char *files[] = {
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -1223,7 +1388,14 @@ int plat_font_path(const char *lang, char *out, size_t cap) {
         "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     };
-    if (strcmp(lang, "ja") && strcmp(lang, "ko") && strcmp(lang, "zh-Hans") && strcmp(lang, "zh-Hant")) return 0;
+    if (!cjk_lang(lang)) return 0;
+    char override[PATH_MAX];
+    if (plat_getenv("TOTK_MENU_FONT", override, sizeof override) && plat_file_exists(override))
+        return snprintf(out, cap, "%s", override) < (int)cap;
+    // menu_font_fontconfig=0 skips the fontconfig lookup and keeps the five fixed paths, for a player whose fontconfig
+    // resolves to a face the font parser cannot read. Read through cfg_bool like every other switch, so totk.ini and
+    // the TOTK_ variable both work and the menu can grey it out.
+    if (cfg_bool("TOTK_MENU_FONT_FONTCONFIG") && fc_font_for(lang, out, cap) && plat_file_exists(out)) return 1;
     for (size_t i = 0; i < sizeof files / sizeof *files; i++)
         if (plat_file_exists(files[i])) return snprintf(out, cap, "%s", files[i]) < (int)cap;
     return 0;
@@ -1263,7 +1435,16 @@ int plat_stderr_path(char *out, size_t cap) {
 
 // ---- process
 
+#ifdef TOTK_PGO_GEN
+// compiler-rt's profile runtime (an instrumented build, tools/build_game.py --pgo gen). It writes its counters from an
+// atexit handler, which _exit skips; __llvm_profile_dump writes them once and makes later writes no-ops.
+int __llvm_profile_dump(void);
+#endif
+
 void plat_exit(int code) {
+#ifdef TOTK_PGO_GEN
+    __llvm_profile_dump();
+#endif
     fflush(stdout);
     fflush(stderr);
     _exit(code);
@@ -1422,6 +1603,41 @@ int plat_open_folder(const char *path) {
 
 void *plat_lib_open(const char *name) { return dlopen(name, RTLD_NOW | RTLD_LOCAL); }
 void *plat_lib_sym(void *lib, const char *name) { return lib ? dlsym(lib, name) : NULL; }
+
+void plat_lib_error(char *out, size_t cap) {
+    const char *e = dlerror();
+    snprintf(out, cap, "%s", e ? e : "unknown error");
+}
+
+int plat_ngx_core_path(char *out, size_t cap) { return snprintf(out, cap, "libnvidia-ngx.so.1") < (int)cap; }
+
+// UTF-8 to UTF-32 wchar_t, without the C library's locale (the runtime never sets one, so mbstowcs would stop at the
+// first non-ASCII byte). Returns 0 on malformed input or when out has no room.
+static int utf8_to_wide(const char *in, wchar_t *out, size_t cap) {
+    const unsigned char *u = (const unsigned char *)in;
+    size_t n = 0;
+    while (*u) {
+        unsigned c = *u++, more = c < 0x80 ? 0 : c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 4;
+        if (more == 4) return 0;
+        if (more) c &= 0x3F >> more;
+        for (unsigned k = 0; k < more; k++, u++) {
+            if ((*u & 0xC0) != 0x80) return 0;
+            c = c << 6 | (*u & 0x3F);
+        }
+        if (n + 1 >= cap) return 0;
+        out[n++] = (wchar_t)c;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+int plat_exe_dir_wide(wchar_t *out, size_t cap) {
+    char dir[PLAT_PATH_MAX];
+    char *cut = plat_exe_path(dir, sizeof dir) ? plat_last_sep(dir) : NULL;
+    if (!cut) return 0;
+    cut[1] = 0;
+    return utf8_to_wide(dir, out, cap);
+}
 
 // ---- machine load: /proc/stat and /proc/self/stat for the CPU, hwmon for the temperature, the amdgpu sysfs files of
 // the render device for the GPU.
@@ -1593,6 +1809,17 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
     if (private_bytes) *proc_mb = (double)(private_bytes >> 20);
 }
 
+void plat_mem_room(uint64_t *commit_room, uint64_t *phys_room) {
+    *commit_room = *phys_room = UINT64_MAX;
+    char line[128];
+    unsigned long long k;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "MemAvailable: %llu kB", &k) == 1) *phys_room = (uint64_t)k << 10;
+    fclose(f);
+}
+
 // ---- child processes
 
 struct PlatChild {
@@ -1653,6 +1880,62 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     while (k < 0 && errno == EINTR);
     return (long)k;
 }
+
+// ---- local IPC (platform.h): Discord's Rich Presence Unix domain socket
+struct PlatIpc { int fd; };
+
+PlatIpc *plat_ipc_connect(const char *name) {
+    const char *dirs[] = {getenv("DISCORD_IPC_PATH"), getenv("XDG_RUNTIME_DIR"), getenv("TMPDIR"), "/tmp"};
+    for (size_t d = 0; d < sizeof dirs / sizeof *dirs; d++) {
+        if (!dirs[d] || !*dirs[d]) continue;
+        char path[sizeof ((struct sockaddr_un *)0)->sun_path];
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dirs[d], name) >= sizeof path) continue;
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return NULL;
+        struct sockaddr_un sa = {0};
+        sa.sun_family = AF_UNIX;
+        strcpy(sa.sun_path, path);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) {
+            PlatIpc *p = malloc(sizeof *p);
+            if (!p) {
+                close(fd);
+                return NULL;
+            }
+            p->fd = fd;
+            return p;
+        }
+        close(fd);   // nothing listens at this path: the next directory may have it
+    }
+    return NULL;
+}
+
+int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms) {
+    struct pollfd pf = {.fd = p->fd, .events = POLLIN};
+    int r = poll(&pf, 1, (int)ms);
+    if (r <= 0) return r < 0 && errno != EINTR ? -1 : 0;
+    ssize_t got = recv(p->fd, buf, n, 0);
+    return got > 0 ? (int)got : -1;   // 0 bytes: the peer closed the socket
+}
+
+int plat_ipc_write(PlatIpc *p, const void *buf, size_t n) {
+    const uint8_t *at = buf;
+    while (n) {
+        ssize_t put = send(p->fd, at, n, MSG_NOSIGNAL);   // a closed peer is an error, not a SIG_PIPE
+        if (put <= 0) {
+            if (put < 0 && errno == EINTR) continue;
+            return 0;
+        }
+        at += put, n -= put;
+    }
+    return 1;
+}
+
+void plat_ipc_close(PlatIpc *p) {
+    if (!p) return;
+    close(p->fd);
+    free(p);
+}
+
 
 // ---- restart
 // TOTK_RESTART_WAIT names the process that called plat_restart, as its id and start time (field 22 of /proc/<pid>/stat,

@@ -125,12 +125,30 @@ static void make_dirs(const char *p) {
     if (!make_dir(buf)) rt_fatal("fs: cannot create directory %s", buf);
 }
 
-// Remove a directory tree; a link (reparse point, symbolic link) is removed as a link, never followed. 0 also when
+// The first path remove_tree could not delete and the OS error code, for the message of a fatal.
+static char remove_failed[1100];
+static int remove_error;
+static void remove_note(const char *path) {
+    if (*remove_failed) return;
+    snprintf(remove_failed, sizeof remove_failed, "%s", path);
+    remove_error = plat_fs_os_error();
+}
+
+// Remove a directory tree; a link (symbolic link, junction) is removed as a link, never followed. 0 also when
 // nothing is there.
 static int remove_tree(const char *path) {
     int kind = plat_fs_kind(path);
     if (kind == PLAT_FS_MISSING) return 0;
-    if (kind == PLAT_FS_FILE) return plat_fs_unlink(path) ? -1 : 0;
+    if (kind == PLAT_FS_FILE) {
+        if (!plat_fs_unlink(path)) return 0;
+        remove_note(path);
+        return -1;
+    }
+    if (kind == PLAT_FS_LINK) {   // a link to a file goes by unlink, a link to a directory by rmdir
+        if (!plat_fs_unlink(path) || !plat_fs_rmdir(path)) return 0;
+        remove_note(path);
+        return -1;
+    }
     int bad = 0;
     if (kind == PLAT_FS_DIR) {
         Listing l;
@@ -142,7 +160,23 @@ static int remove_tree(const char *path) {
         }
         listing_free(l.e, l.n);
     }
-    return bad | (plat_fs_rmdir(path) ? -1 : 0);
+    if (plat_fs_rmdir(path)) {
+        remove_note(path);
+        bad |= -1;
+    }
+    return bad;
+}
+
+// remove_tree, tried again every 50 ms for up to 2 s while another process (the previous run still exiting, a virus
+// scanner, a sync client) holds a file in the tree. The failing path and its OS error stay in remove_failed.
+#define MOVE_TRIES 40   // 2 s, also move_dir's
+static int remove_tree_retry(const char *path) {
+    for (int i = 0;; i++) {
+        *remove_failed = 0;
+        if (!remove_tree(path)) return 0;
+        if (i == MOVE_TRIES) return -1;
+        plat_sleep_ms(50);
+    }
 }
 
 // ---- save transactions
@@ -190,7 +224,6 @@ static int exists(const char *p) { return plat_fs_kind(p) != PLAT_FS_MISSING; }
 
 // Rename a directory, durably; retried every 50 ms, tries times in all, while another process (a virus scanner, the
 // indexer) holds a file in it. 0 on success.
-#define MOVE_TRIES 40   // 2 s
 static int move_dir(const char *from, const char *to, int tries) {
     for (int i = 0; i < tries; i++) {
         int e = plat_fs_rename(from, to, 1);
@@ -248,6 +281,18 @@ static int same_file(const char *a, const char *b) {
     return same;
 }
 
+// The folder of the save (slot_00 ...) whose file the running commit wrote first, for quick save (fs_save_commits):
+// note_changed takes the first path component under new_root of each file copy_tree copies instead of linking.
+static char changed_slot[64], last_slot[64];
+static uint32_t commits;   // commits that changed a file, under tx_lock
+static void note_changed(const char *dst) {
+    size_t n = strlen(new_root);
+    if (changed_slot[0] || !n || strncmp(dst, new_root, n) || dst[n] != '/') return;
+    const char *rel = dst + n + 1, *sl = strchr(rel, '/');
+    size_t len = sl ? (size_t)(sl - rel) : sizeof changed_slot;
+    if (len < sizeof changed_slot) memcpy(changed_slot, rel, len), changed_slot[len] = 0;
+}
+
 // Copy the tree src to dst, which must not exist; links are skipped. durable: every file is flushed, and every
 // directory as far as the file system allows. base (or NULL): the committed save; a file whose bytes equal base's file
 // at the same path becomes a hard link to it instead of a copy (*nlinked), as committed files are never written in
@@ -267,7 +312,7 @@ static int copy_tree(const char *src, const char *dst, const char *base, int dur
         if (l.e[i].kind == PLAT_FS_DIR) bad = copy_tree(s, d, b, durable, nfiles, nlinked, bytes);
         else {
             if (b && same_file(s, b) && !plat_fs_link(b, d)) bad = 0, ++*nlinked;
-            else bad = copy_file(s, d, durable, bytes);
+            else bad = copy_file(s, d, durable, bytes), note_changed(d);
             *nfiles += !bad;
             if (!bad && durable && crashed()) bad = -1;
         }
@@ -446,7 +491,8 @@ static void save_recover(void) {
         did = swap_in() ? "a finished commit still waits in save-tx; the game loads it from there"
                         : "completed a finished commit";
     if (exists(work_root)) {
-        if (remove_tree(work_root)) rt_fatal("fs: cannot delete the old save working copy");
+        if (remove_tree_retry(work_root))
+            rt_fatal("fs: cannot delete the old save working copy: %s (OS error %d)", remove_failed, remove_error);
         if (!strcmp(did, "nothing to recover"))
             did = "deleted the last run's working copy (changes after its last Commit)";
     }
@@ -475,6 +521,7 @@ static uint32_t save_commit_locked(void) {
     int nfiles = 0, linked = 0;
     tx_step = tx_dead = 0;
     const char *base = exists(newest_save()) ? newest_save() : NULL;
+    changed_slot[0] = 0;
     if (remove_tree(new_root) || copy_tree(work_root, new_root, base, 1, &nfiles, &linked, &bytes)) {
         if (tx_dead) return FS_R_INVALID_ARGUMENT;
         rt_log("fs: save commit: copying the working copy failed; the newest save is unchanged");
@@ -501,6 +548,8 @@ static uint32_t save_commit_locked(void) {
     ready_seq++;
     if (*ready_root) remove_tree(ready_root);   // superseded: the working copy it was made from held all of it
     snprintf(ready_root, sizeof ready_root, "%s", ready);
+    commits++;
+    memcpy(last_slot, changed_slot, sizeof last_slot);
     plat_xchg32(&save_dirty, 0);
     if (crashed()) return FS_R_INVALID_ARGUMENT;
     int waits = swap_in();
@@ -523,6 +572,34 @@ static void save_wait_commit(void) {
 }
 
 void fs_save_flush(void) { save_wait_commit(); }
+
+// ---- quick save (quicksave.c): the save folder the last commit wrote, copied out of the newest save
+uint32_t fs_save_commits(char *slot, size_t cap) {
+    plat_mutex_lock(&tx_lock);
+    uint32_t n = commits;
+    snprintf(slot, cap, "%s", last_slot);
+    plat_mutex_unlock(&tx_lock);
+    return n;
+}
+
+// The folder slot of the newest save to dst (replaced). 0 on success.
+static int slot_name_ok(const char *slot) {
+    return slot[0] && slot[0] != '.' && !strchr(slot, '/') && !strchr(slot, '\\') && !strchr(slot, ':');
+}
+
+int fs_save_copy_slot(const char *slot, const char *dst) {
+    if (!*save_root || !slot_name_ok(slot)) return -1;
+    save_wait_commit();
+    plat_mutex_lock(&tx_lock);
+    char *src = join(newest_save(), slot);
+    int n = 0, linked = 0;
+    uint64_t bytes = 0;
+    int bad = plat_fs_kind(src) != PLAT_FS_DIR || remove_tree(dst) || copy_tree(src, dst, NULL, 1, &n, &linked, &bytes);
+    plat_mutex_unlock(&tx_lock);
+    free(src);
+    return bad ? -1 : 0;
+}
+
 
 static uint32_t commit_run(void) {
     plat_mutex_lock(&tx_lock);
@@ -843,6 +920,33 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     return got < 0 ? -1 : got;
 }
 
+// Quick load (quicksave.c, fs_save_read_from): while set, a read-only open of a file of any slot folder of the save
+// mount (save:/slot_NN/<file>) opens <file> of this folder instead, so the game loads the quick save whichever slot it
+// was asked to load, and no slot of the save is written for it.
+static char read_from[PATH_CAP];
+static volatile int32_t read_from_on, read_from_hits;
+
+void fs_save_read_from(const char *dir) {
+    if (dir) snprintf(read_from, sizeof read_from, "%s", dir), plat_xchg32(&read_from_hits, 0);
+    plat_xchg32(&read_from_on, dir != NULL);
+}
+
+int fs_save_read_from_hits(void) { return plat_cas32(&read_from_hits, 0, 0); }
+
+static void redirect_slot_read(const char *path, char *p, size_t cap) {
+    const char *rest = strstr(path, ":/slot_");
+    if (!rest) return;
+    const char *d = rest + 7, *file;
+    while (*d >= '0' && *d <= '9') d++;
+    if (d == rest + 7 || *d != '/' || !d[1] || strchr(d + 1, '/')) return;
+    file = d + 1;
+    char q[PATH_CAP];
+    if (snprintf(q, sizeof q, "%s/%s", read_from, file) >= (int)sizeof q || plat_fs_kind(q) != PLAT_FS_FILE) return;
+    rt_log("fs: quick load: %s read from %s", path, q);
+    snprintf(p, cap, "%s", q);
+    plat_inc32(&read_from_hits);
+}
+
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) return romfs_open(out, path, mode);
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
@@ -851,6 +955,8 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     int kind = M_FREE;
     uint32_t r = host_path_kind(path, p, sizeof p, &kind);
     if (r) return r;
+    if (kind == M_SAVE && !(mode & FS_OPEN_WRITE) && plat_cas32(&read_from_on, 0, 0))
+        redirect_slot_read(path, p, sizeof p);
     if (plat_fs_kind(p) != PLAT_FS_FILE) return FS_R_PATH_NOT_FOUND;
     if (kind == M_SAVE_RO && (mode & FS_OPEN_WRITE)) return FS_R_UNSUPPORTED_OPEN;
     int save_writer = kind == M_SAVE && (mode & FS_OPEN_WRITE);
@@ -1575,6 +1681,15 @@ static void probe_save_tx(const uint64_t *uid) {
     CALL(S_UNMOUNT, U("ro"));
     CHECK(RES(S_DELETE_FILE, U(a)) == 0 && RES(S_DELETE_FILE, U(b)) == 0 && tx_commit() == 0 &&
           tx_read_committed("tx_a.sav") == -1, "Commit of deletions");
+    // a run that left read-only folders and files in the working copy (attributes another emulator's save carried):
+    // the next start deletes them and names the failing path if it cannot
+    char *ro_dir = join(work_root, "ro_dir"), *ro_file = join(ro_dir, "ro.sav");
+    CHECK(!plat_fs_mkdir(ro_dir) && plat_file_write(ro_file, "x", 1) && plat_file_set_readonly(ro_file, 1) &&
+          plat_file_set_readonly(ro_dir, 1), "read-only leftovers in the working copy");
+    probe_restart(uid);
+    CHECK(!exists(ro_dir), "the next start deleted a working copy with read-only folders");
+    free(ro_dir);
+    free(ro_file);
     printf("save tx: uncommitted writes visible to the game and dropped by a restart and by Unmount, commits kept; a "
            "crash at each of %d commit steps recovers to the old save %d times, the new one %d times, mixed %d "
            "times; %d backups\n", steps, olds, news, mixed, backups);
@@ -1727,6 +1842,7 @@ int probe_fs(void) {
     pcpu = plat_aligned_alloc(sizeof(Cpu), 64);
     need(pcpu != NULL, "probe Cpu");
     memset(pcpu, 0, sizeof *pcpu);
+    rt_fpcr_threshold(pcpu);
     uint8_t *stack = mem_kernel_alloc(0x10000, 16);
     pcpu->sp = (uint64_t)(uintptr_t)stack + 0x10000;
     pcpu->excl_addr = ~0ull;
