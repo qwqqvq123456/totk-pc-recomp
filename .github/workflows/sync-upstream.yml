@@ -117,6 +117,14 @@ jobs:
               echo "merged=prefer-ours" >> "$GITHUB_OUTPUT"
               echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
             else
+              {
+                echo '### Upstream sync conflicted'
+                echo
+                echo "Conflicted files: \`$conflicts\`"
+                echo
+                echo "\`main\` was left untouched and no tag was pushed. Merge upstream by hand, or dispatch this"
+                echo "workflow with \`merge_strategy\` set to \`prefer-ours\`."
+              } >> "$GITHUB_STEP_SUMMARY"
               echo "::error::Merge conflicted in $conflicts; main was left untouched"
               exit 1
             fi
@@ -186,7 +194,9 @@ jobs:
           cat CHANGELOG.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report a conflict
+        # Issues are optional and may be disabled on a fork; the failed run's summary always carries the file list.
         if: failure() && steps.merge.outputs.conflicts != ''
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}

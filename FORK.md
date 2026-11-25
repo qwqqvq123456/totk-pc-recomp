@@ -32,8 +32,9 @@ release notes of that tag are the same text.
 ## When a merge conflicts
 
 The fork's own files are `.github/` and `CHANGELOG.md`. A conflict means upstream changed something the fork also holds,
-so the run stops, `main` is left untouched, no tag is pushed, and an issue lists the files. Merge it by hand, or dispatch
-the sync again with `merge_strategy` set to `prefer-ours` to keep the fork's side of the conflicting hunks.
+so the run stops, `main` is left untouched and no tag is pushed. The failed run's summary lists the files; an issue is
+opened as well when Issues are enabled on the fork. Merge it by hand, or dispatch the sync again with `merge_strategy`
+set to `prefer-ours` to keep the fork's side of the conflicting hunks.
 
 ## The setup archives
 
