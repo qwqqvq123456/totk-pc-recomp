@@ -47,6 +47,12 @@ jobs:
       - name: Everything still parses
         run: python -m compileall -q recomp tools installer .github/scripts
 
+      - name: Install what importing the installer needs
+        # installer/steps.py imports tools/extract.py, which imports the vendored scripts, which need cryptography. The rest
+        # of tools/requirements-installer.txt belongs to the release's bundled Python and moves with it, so it is not what
+        # these tests check against.
+        run: python -m pip install --disable-pip-version-check cryptography
+
       - name: Installer bookkeeping and shader cache packing (no game files, stdlib only)
         run: |
           python tests/installer_test.py
