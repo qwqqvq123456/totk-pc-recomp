@@ -25,6 +25,11 @@ CHANGELOG = ROOT / 'CHANGELOG.md'
 UPSTREAM = os.environ.get('UPSTREAM_REPO', 'valentderah/totk-pc-recomp')
 UPSTREAM_URL = 'https://github.com/' + UPSTREAM
 
+# Commits a section lists. A first sync can carry a month of upstream work; a release body has a size limit and a
+# changelog nobody scrolls, so the newest ones are listed and the compare link covers the rest.
+LIMIT = 150
+PR_LIMIT = 30
+
 HEADER = """# Changelog
 
 This fork follows [`%(upstream)s`](%(url)s) and adds nothing of its own to the code.
@@ -88,21 +93,31 @@ def section(start, end, version, tag, date):
     """The markdown of one sync: what upstream moved to, the commits it brought in, the pull requests they came from."""
     commits = imported_commits(start, end)
     pulls = merged_pull_requests(start, end)
+    omitted = max(0, len(commits) - LIMIT)
+    commits = commits[omitted:]   # the newest, so a long first sync does not bury the rest of the file
     lines = ['## %s (%s)' % (tag.lstrip('v') or version, date), '']
 
     if commits:
+        total = len(commits) + omitted
         lines.append('Upstream `%s` moved from %s to %s: %d commit%s.' %
-                     (UPSTREAM, commit_link(start), commit_link(end), len(commits), '' if len(commits) == 1 else 's'))
+                     (UPSTREAM, commit_link(start), commit_link(end), total, '' if total == 1 else 's'))
     else:
         lines.append('Upstream `%s` was re-synced at %s; no new commits.' % (UPSTREAM, commit_link(end)))
     lines.append('')
+    if omitted:
+        lines.append('The newest %d are listed; the %d before them are in the compare below.' % (len(commits), omitted))
+        lines.append('')
 
     lines.extend(entry(sha) for sha in commits)
     if commits:
         lines.append('')
     if pulls:
-        links = ', '.join('[#%s](%s/pull/%s)' % (n, UPSTREAM_URL, n) for n in pulls)
-        lines.append('Pull requests merged: %s' % links)
+        shown = pulls[-PR_LIMIT:]
+        links = ', '.join('[#%s](%s/pull/%s)' % (n, UPSTREAM_URL, n) for n in shown)
+        if len(shown) < len(pulls):
+            lines.append('Pull requests merged, the newest %d of %d: … %s' % (len(shown), len(pulls), links))
+        else:
+            lines.append('Pull requests merged: %s' % links)
         lines.append('')
 
     if start and end and start != end:

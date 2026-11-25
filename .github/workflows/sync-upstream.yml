@@ -75,10 +75,8 @@ jobs:
           upstream_sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
           # The last upstream commit the fork merged is the merge base of the two branches.
           synced_sha=$(git merge-base HEAD "upstream/$UPSTREAM_BRANCH" || true)
-          base_version=$(tr -d '[:space:]' < VERSION)
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
           echo "synced_sha=$synced_sha" >> "$GITHUB_OUTPUT"
-          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "main already has $UPSTREAM_REPO@$upstream_sha"
@@ -108,6 +106,7 @@ jobs:
           message=$(printf 'Sync with %s at %s (%s commits)' "$UPSTREAM_REPO" "${UPSTREAM_SHA:0:7}" "$COMMIT_COUNT")
           if git merge --no-ff --no-edit -m "$message" "upstream/$UPSTREAM_BRANCH"; then
             echo "merged=clean" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
             conflicts=$(git diff --name-only --diff-filter=U | paste -sd' ' -)
             git merge --abort
@@ -116,6 +115,7 @@ jobs:
               echo "::warning::Merge conflicted in $conflicts; keeping the fork's side of those hunks (prefer-ours)"
               git merge --no-ff --no-edit -X ours -m "$message" "upstream/$UPSTREAM_BRANCH"
               echo "merged=prefer-ours" >> "$GITHUB_OUTPUT"
+              echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
             else
               echo "::error::Merge conflicted in $conflicts; main was left untouched"
               exit 1
@@ -125,7 +125,8 @@ jobs:
       - name: Work out this sync's version and tag
         id: version
         run: |
-          base='${{ steps.upstream.outputs.base_version }}'
+          # upstream's VERSION in the tree the merge produced, not the one main had before it
+          base=$(tr -d '[:space:]' < VERSION)
           highest=0
           for tag in $(git tag -l "v$base-sync.*"); do
             number=${tag##*.}
@@ -149,11 +150,14 @@ jobs:
             --tag '${{ steps.version.outputs.tag }}'
 
       - name: Fold the section into the sync commit
+        env:
+          MERGE_COMMIT: ${{ steps.merge.outputs.head }}
         run: |
           git add CHANGELOG.md
           if git diff --cached --quiet; then
             echo "CHANGELOG.md is unchanged"
-          elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+          elif [ -n "$MERGE_COMMIT" ] && [ "$(git rev-parse HEAD)" = "$MERGE_COMMIT" ]; then
+            # one commit per sync: the merge carries its own changelog section
             git commit --amend --no-edit
           else
             git commit -m "Add the changelog section for ${{ steps.version.outputs.tag }}"
