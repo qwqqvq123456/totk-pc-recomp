@@ -1,0 +1,75 @@
+name: Build installer (self-hosted)
+
+# The setup (`TotK-Setup-*`) is built from the player's own game files — docs/installer.md — so it cannot be built on
+# GitHub's runners: tools/make_release.py needs generated/v121 and the toolchain of docs/building.md. This workflow runs
+# it on a machine that already has both, then attaches the archive to the tag's release.
+#
+# Off until a runner is registered: set the repository variable TOTK_RUNNER to the runner's labels as JSON, for example
+#   gh variable set TOTK_RUNNER --body '["self-hosted","Windows","X64","totk"]'
+# and TOTK_WORKDIR to the folder that holds generated/, toolchain/, build/xlate and .venv-py314 on that machine.
+# Nothing here runs on GitHub's own runners, and Release does not wait for it.
+#
+# Windows only: tools/make_release_linux.py builds the AppImage on Linux (docs/installer.md, "Linux release"), which the
+# same runner folder serves if you copy the workflow and swap the commands.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag whose release gets the archive
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-installer-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.TOTK_RUNNER != ''
+    runs-on: ${{ fromJSON(vars.TOTK_RUNNER) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Bring the extracted game and the toolchain into the checkout
+        env:
+          WORKDIR: ${{ vars.TOTK_WORKDIR }}
+        shell: pwsh
+        run: |
+          foreach ($dir in 'generated', 'toolchain', 'build', '.venv-py314') {
+            $from = Join-Path $env:WORKDIR $dir
+            if (Test-Path $from) {
+              robocopy $from (Join-Path $env:GITHUB_WORKSPACE $dir) /E /NFL /NDL /NJH /NJS | Out-Null
+              Write-Host "copied $dir"
+            } else {
+              Write-Host "::warning::$from is missing; tools/make_release.py will stop if it needs it"
+            }
+          }
+
+      - name: Build the shader translator
+        shell: pwsh
+        run: .venv-py314\Scripts\python.exe tools\build_xlate.py
+
+      - name: Assemble the setup and zip it
+        shell: pwsh
+        run: |
+          .venv-py314\Scripts\python.exe tools\make_release.py `
+            --out build\release\TotK-Setup `
+            --zip build\release\TotK-Setup.zip `
+            --prove
+
+      - name: Attach the archive to the release
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          VERSION: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          $name = "TotK-Setup-$($env:VERSION.TrimStart('v'))-windows.zip"
+          Copy-Item build\release\TotK-Setup.zip "build\release\$name"
+          gh release upload $env:VERSION "build\release\$name" --clobber --repo $env:GITHUB_REPOSITORY

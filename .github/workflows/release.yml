@@ -1,0 +1,138 @@
+name: Release
+
+# Publishes the tag a sync pushed (.github/workflows/sync-upstream.yml): the same checks CONTRIBUTING.md asks for, the
+# source archive of that tag, and release notes taken from the tag's CHANGELOG.md section, so the release, the changelog
+# and the tag cannot disagree.
+#
+# The archive holds sources only. The setup (`TotK-Setup-*`) needs your own game files to build and is made on a machine
+# that has them: either by hand (docs/installer.md) or by .github/workflows/build-installer.yml on a self-hosted runner.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Content guard, syntax, tests
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Nothing game-derived in the tag
+        run: python tools/check_content.py
+
+      - name: Everything still parses
+        run: python -m compileall -q recomp tools installer .github/scripts
+
+      - name: Installer bookkeeping and shader cache packing (no game files, stdlib only)
+        run: |
+          python tests/installer_test.py
+          python tests/pack_shader_cache_test.py
+
+  package:
+    name: Source archive and release notes
+    needs: check
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Name the version
+        id: version
+        run: |
+          tag="$TAG"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::$tag is not a v* tag"; exit 1 ;;
+          esac
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack the tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          prefix="totk-recomp-$VERSION/"
+          git archive --format=zip --prefix="$prefix" -o "dist/totk-recomp-$VERSION-src.zip" "refs/tags/$TAG"
+          git archive --format=tar.gz --prefix="$prefix" -o "dist/totk-recomp-$VERSION-src.tar.gz" "refs/tags/$TAG"
+          ( cd dist && sha256sum *.zip *.tar.gz > sha256sums.txt && cat sha256sums.txt )
+
+      - name: Write the release notes from the changelog
+        run: python .github/scripts/changelog.py notes --tag "$TAG" --out dist/release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: package
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$TAG"
+          version="${tag#v}"
+          case "$version" in
+            *-rc*|*-alpha*|*-beta*|*-pre*) prerelease='--prerelease' ;;
+            *) prerelease='--latest' ;;
+          esac
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Updating the existing release $tag"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes-file dist/release-notes.md $prerelease
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/totk-recomp-*-src.zip dist/totk-recomp-*-src.tar.gz dist/sha256sums.txt
+          else
+            echo "Creating the release $tag"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --verify-tag \
+              --notes-file dist/release-notes.md $prerelease \
+              dist/totk-recomp-*-src.zip dist/totk-recomp-*-src.tar.gz dist/sha256sums.txt
+          fi
+          {
+            echo "### Released $tag"
+            echo
+            echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag"
+          } >> "$GITHUB_STEP_SUMMARY"
