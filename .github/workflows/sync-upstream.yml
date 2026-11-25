@@ -124,6 +124,7 @@ jobs:
 
       - name: Work out this sync's version and tag
         id: version
+        if: steps.upstream.outputs.changed == 'true' || env.RELEASE_WITHOUT_CHANGES == 'true'
         run: |
           # upstream's VERSION in the tree the merge produced, not the one main had before it
           base=$(tr -d '[:space:]' < VERSION)
@@ -139,6 +140,7 @@ jobs:
 
       - name: Write the changelog section
         id: changelog
+        if: steps.upstream.outputs.changed == 'true' || env.RELEASE_WITHOUT_CHANGES == 'true'
         env:
           FROM_SHA: ${{ steps.upstream.outputs.synced_sha }}
           TO_SHA: ${{ steps.upstream.outputs.upstream_sha }}
@@ -150,6 +152,7 @@ jobs:
             --tag '${{ steps.version.outputs.tag }}'
 
       - name: Fold the section into the sync commit
+        if: steps.upstream.outputs.changed == 'true' || env.RELEASE_WITHOUT_CHANGES == 'true'
         env:
           MERGE_COMMIT: ${{ steps.merge.outputs.head }}
         run: |
@@ -164,10 +167,12 @@ jobs:
           fi
 
       - name: Push main
+        if: steps.upstream.outputs.changed == 'true' || env.RELEASE_WITHOUT_CHANGES == 'true'
         run: |
           git push origin HEAD:main
 
       - name: Tag the sync
+        if: steps.upstream.outputs.changed == 'true' || env.RELEASE_WITHOUT_CHANGES == 'true'
         run: |
           tag='${{ steps.version.outputs.tag }}'
           git tag -a "$tag" -m "Sync with $UPSTREAM_REPO at ${{ steps.upstream.outputs.upstream_sha }}"
